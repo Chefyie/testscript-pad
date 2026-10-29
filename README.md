@@ -130,3 +130,7 @@ The **Problems** panel updates as you type. `F5` runs the check and `F8` jumps t
 Settings are stored in `%APPDATA%\Testscript-Pad\settings.json`.
 
 To teach the editor new commands, inputs, outputs, keyvalues or entity classes, add a line to the matching table at the top of `tslang.py` (`name | description`).
+
+## License
+
+[MIT](LICENSE) © 2026 RageTails
