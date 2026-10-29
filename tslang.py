@@ -8,7 +8,7 @@ top to bottom:
     ent_fire x addoutput"origin 0 0 11;)
   * a '"' starts a string that ends at the next '"', ';' or end of line
   * '//' starts a comment
-  * a line starting with '///' ends the script
+  * a line that is just '///' ends the script ('///Heading' is an ordinary comment)
   * Test_Wait <seconds> pauses the script so queued ent_fire events can run
 
 This module has no GUI code: vocabulary, lexer, highlighter, completion
@@ -247,6 +247,9 @@ playvoblue | tf_gamerules: plays a voice-over to BLU
 turnon | Turns on (lights, rotating)
 turnoff | Turns off
 ignite | Sets on fire
+dissolve | env_entity_dissolver: dissolves its target
+showhudhint | env_hudhint: shows the hint to the activator
+hidehudhint | env_hudhint: hides the hint
 settext | Sets text
 """)
 
@@ -523,6 +526,11 @@ env_fire | Fire
 env_smokestack | Smoke
 env_lightglow | Light glow
 env_screenoverlay | Screen overlay
+env_entity_dissolver | Dissolves entities (Dissolve input)
+env_hudhint | Shows a HUD hint (ShowHudHint / HideHudHint)
+env_message | Shows a HUD message
+env_global | Sets a global state
+game_player_equip | Gives players items
 ambient_generic | Sound (PlaySound/StopSound)
 multisource | Fires OnTrigger when used (scripts use it as a relay that survives restarts)
 prop_dynamic | Animated/model prop
@@ -683,7 +691,8 @@ def lex_line(line):
 
 
 def is_end_marker(line):
-    return line.lstrip().startswith('///')
+    # only a bare '///' ends the script; '///Menu text' and '//////' are used as headings
+    return line.strip() == '///'
 
 
 # --------------------------------------------------------------------------
@@ -1026,6 +1035,7 @@ class Analysis:
         self.sections = []           # (line, title)
         self.end_line = None
         self.diagnostics = []
+        self.map = None              # mapdata.MapInfo the script was checked against
 
     def alias_names(self):
         return frozenset(self.aliases)
@@ -1044,7 +1054,20 @@ class Analysis:
         self.diagnostics.append(Diagnostic(line, col, end, severity, message))
 
 
-RUNTIME_NAME_RE = re.compile(r'addoutput,\s*targetname\s+([^\s,;"]+)', re.I)
+# names given anywhere on a line, including inside outputs and point_servercommand strings:
+# !activator,addoutput,targetname zomb / prop_dynamic,addoutput,classname xa /
+# psc,command,ent_keyvalue 2794076 targetname resupplytrigger_red
+RUNTIME_NAME_RE = re.compile(r'\b(?:targetname|classname)[\s"]+([A-Za-z0-9_!@`^.$#?\-]+)', re.I)
+
+# entities the game creates while running, so they are never in the .bsp
+RUNTIME_ENTITIES = {'spotlight_end', 'phys_bone_follower', 'zz_teamplay_waiting_timer',
+                    'item_teamflag_return_icon', 'tf_ammo_pack', 'tf_ragdoll', 'tf_player_manager',
+                    'tf_team', 'tf_objective_resource', 'instanced_scripted_scene', 'team_train_watcher',
+                    'tf_projectile_rocket', 'tf_projectile_pipe', 'tf_projectile_pipe_remote',
+                    'tf_projectile_arrow', 'tf_projectile_flare', 'tf_projectile_syringe',
+                    'game_ragdoll_manager', 'ai_network', 'soundent', 'player_manager', 'scene_manager',
+                    'env_sprite_oriented', 'beam', 'move_rope', 'keyframe_rope'}
+RUNTIME_PREFIXES = ('tf_weapon_', 'tf_wearable', 'tf_projectile_', 'obj_')
 
 
 def _value(text):
@@ -1052,8 +1075,11 @@ def _value(text):
 
 
 class _Checker:
-    def __init__(self, text):
+    def __init__(self, text, mapinfo=None):
         self.a = Analysis()
+        self.a.map = mapinfo
+        self.map = mapinfo
+        self.refs = []           # (line, col, end, target) checked against the map at the end
         self.lines = text.split('\n')
         self.live = set()        # classnames spawned by the script and not renamed yet
         self.pending_ids = set() # hammerids set since the last Test_Wait
@@ -1065,7 +1091,9 @@ class _Checker:
         for ln, line in enumerate(self.lines, 1):
             if a.end_line is not None:
                 if line.strip() and not warned_after_end:
-                    a.diag(ln, 0, len(line), 'info', "Text after the '///' end marker is ignored")
+                    a.diag(ln, 0, len(line), 'warning',
+                           f"Everything after the '///' on line {a.end_line} is ignored - "
+                           "move the '///' to the end if these lines should run")
                     warned_after_end = True
                 continue
             if is_end_marker(line):
@@ -1081,14 +1109,32 @@ class _Checker:
             for m in RUNTIME_NAME_RE.finditer(line):
                 a.add_name(m.group(1), ln, 'runtime targetname')
         if a.end_line is None and any(l.strip() for l in self.lines):
-            last = len(self.lines)
-            a.diag(last, 0, len(self.lines[-1]), 'warning',
-                   "Script has no '///' end marker - testscripts normally end with a '///' line")
+            last = max(i for i, l in enumerate(self.lines, 1) if l.strip())
+            a.diag(last, 0, len(self.lines[last - 1]), 'error',
+                   "Missing '///' at the end - without it the last lines of the script won't run correctly")
         for name, (ln, body) in a.aliases.items():
             if not a.alias_uses[name]:
                 a.diag(ln, 0, len(self.lines[ln - 1]), 'info', f"Alias '{name}' is never used")
+        if self.map is not None:
+            self.check_targets()
         a.diagnostics.sort(key=lambda d: (d.line, d.col))
         return a
+
+    def check_targets(self):
+        """Flag targets that are neither made by the script nor in the map."""
+        names = {n.lower() for n in self.a.names}
+        seen = set()
+        for ln, col, end, target, inp in self.refs:
+            t = target.strip().strip('"; ')
+            tl = t.lower()
+            if (len(tl) <= 1 or '*' in tl or tl.startswith('!') or tl in ENTITIES_L or tl in names
+                    or tl in RUNTIME_ENTITIES or tl.startswith(RUNTIME_PREFIXES) or (ln, tl) in seen):
+                continue    # wildcards and 1-letter names are deliberate (clean-up / do-nothing outputs)
+            if inp.strip().lower() in ('kill', 'killhierarchy') or self.map.has_target(tl):
+                continue    # killing something that isn't there is harmless
+            seen.add((ln, tl))
+            self.a.diag(ln, col, end, 'warning',
+                        f"'{t}' isn't made by this script and isn't in {self.map.name} - typo?")
 
     # -- helpers ---------------------------------------------------------
     def span(self, via, w):
@@ -1110,6 +1156,8 @@ class _Checker:
 
     def check_output(self, value, ln, col, end):
         fields = value.split(',')
+        if self.map is not None and fields[0].strip():
+            self.refs.append((ln, col, end, fields[0], fields[1] if len(fields) > 1 else ''))
         if len(fields) > 5:
             self.a.diag(ln, col, end, 'warning',
                         'Output has more than 5 fields (target,input,parameter,delay,times)')
@@ -1194,6 +1242,8 @@ class _Checker:
         if tl in INPUTS_L and tl not in ENTITIES_L and tl not in {n.lower() for n in a.names}:
             a.diag(ln, *self.span(via, args[0]), 'warning',
                    f"ent_fire target '{target}' looks like an input - is a word missing or doubled?")
+        elif self.map is not None:
+            self.refs.append((ln, *self.span(via, args[0]), target, inp))
         if inp != 'addoutput' or len(args) < 3:
             return
         p = args[2]
@@ -1228,7 +1278,14 @@ class _Checker:
         ident = args[0].text
         span = self.span(via, args[0])
         scripted = ident in a.hammerids
-        if ident.isdigit():
+        if ident.isdigit() and not scripted and self.map is not None:
+            if ident not in self.map.by_hammerid:
+                a.diag(ln, *span, 'warning',
+                       f"hammerid {ident} isn't in {self.map.name} and isn't assigned by this script")
+        elif not ident.isdigit():
+            if self.map is not None:
+                self.refs.append((ln, *span, ident, ''))
+        elif ident.isdigit():
             if not scripted and int(ident) < 10000:
                 a.diag(ln, *span, 'warning',
                        f"hammerid {ident} is never assigned before this line "
@@ -1259,8 +1316,9 @@ class _Checker:
                 self.check_output(v, ln, *self.span(via, val))
 
 
-def analyze(text):
-    return _Checker(text).run()
+def analyze(text, mapinfo=None):
+    """Check a script. mapinfo (mapdata.MapInfo) adds checks against the map's entities."""
+    return _Checker(text, mapinfo).run()
 
 
 # --------------------------------------------------------------------------

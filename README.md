@@ -4,13 +4,15 @@ An editor for **Orange Box / TF2 testscripts** that understands the testscript l
 
 Testscripts are text files of console commands (`ent_fire`, `give`, `ent_keyvalue`, `Test_Wait`, ...) that the game runs from top to bottom. People use them to build whole gamemodes: KOTH on 2Fort, Payload on Dustbowl, CTF on Hydro, Zombie Fortress and so on. Testscript-Pad adds syntax highlighting, autocomplete, a script checker and builders for the long entity blocks these scripts are made of.
 
-## Requirements
-
-- Windows (it also runs on other systems, but the dark title bar and some defaults are Windows-only)
-- [Python 3](https://www.python.org/downloads/) with tkinter (the standard Windows installer includes it)
-- No extra packages
-
 ## Getting started
+
+### The .exe (no Python needed)
+
+Download **`Testscript-Pad.exe`** from the [Releases](https://github.com/Chefyie/testscript-pad/releases) page and run it. You can drag `.txt` testscripts onto it, or set it as the program that opens them. It's a single file and doesn't need installing. Windows SmartScreen may warn the first time, because the `.exe` isn't signed: choose *More info → Run anyway*.
+
+### From source
+
+You need Windows and [Python 3](https://www.python.org/downloads/) with tkinter, which the standard Windows installer includes. There are no extra packages.
 
 1. Download or clone this repository.
 2. Double-click **`Testscript-Pad.bat`**, or drag `.txt` testscripts onto it.
@@ -20,6 +22,10 @@ You can also run it directly:
 ```bash
 pythonw testscript_pad.py path/to/script.txt
 ```
+
+### Building the .exe yourself
+
+Double-click **`build.bat`**. The first time, it creates a `.venv-build` folder and installs [PyInstaller](https://pyinstaller.org) into it, without touching your normal Python. The result is `dist\Testscript-Pad.exe`. The icon comes from `assets\icon.ico`, which `tools\make_icon.py` draws.
 
 The open dialog starts in `D:\Games\game\tf\testscripts` if that folder exists. Open tabs are restored the next time you start the editor.
 
@@ -59,7 +65,7 @@ The status bar explains the word under the cursor: what a command, input or outp
 
 The **Problems** panel updates as you type. `F5` runs the check and `F8` jumps to the next problem. It flags:
 
-- a missing `///` end marker, or text after it
+- a missing `///` at the end (without it the last lines of the script don't run correctly; **Run in game** offers to add it), or lines after the `///` that will be ignored. Only a line that is just `///` ends the script: `///Heading` and `//////` lines are ordinary comments.
 - `ent_keyvalue` on a hammerid that was never assigned
 - `ent_keyvalue` right after `addoutput"hammerid N` with no `Test_Wait` in between (`ent_fire` is queued, so the entity doesn't have the id yet)
 - the same hammerid assigned twice, or the same targetname given to two new entities
@@ -93,6 +99,26 @@ The script must be saved somewhere under `tf\testscripts\`. The game folder (the
 - **Seconds to wait before the script starts:** default 20. The countdown starts when the map starts loading, and connecting to your own server takes around 13 seconds on 2Fort. Starting a script before you're in the game crashes TF2, so raise this if the game crashes on launch.
 - **Run in the already-running game:** on by default
 - **Clipboard command:** `{path}` is the path from the testscripts folder, `{name}` is just the file name
+
+### Game link
+
+When **Run in game** starts TF2, it adds `-usercon -condebug +rcon_password <password>`, so Testscript-Pad can talk to the game over its remote console (RCON). The password is random, made once and kept in your settings. The game's address is found automatically. Then:
+
+- **`F9` with TF2 open** runs the script inside it over the link. If the link isn't available (for example, the game was started from `client.bat`), it falls back to `-hijack`.
+- **Game console (`` Ctrl+` ``)** shows the game's console live (from `tf\console.log`), and you can type commands that run in the game, with Up/Down for history.
+- **From game**, in the coordinate dialog, or **Position from game (`Ctrl+Shift+P`)** reads where you're standing (`getpos`) straight into the coordinate dialog.
+- **The status bar** shows *game linked* / *game not linked*. Click it to connect to a game that's already running.
+
+Turn it off under **Tools → Game settings...** if you don't want RCON on.
+
+### Map entities
+
+The editor reads the entities out of the script's map (`tf\maps\<map>.bsp`). It picks the map from the script's folder, the same way **Run in game** does (`Gamemodes/2Fort/...` → `ctf_2fort`). With that it knows every entity the map already has:
+
+- **Autocomplete** suggests map names (`flag_blue`, `door_blue1_2_up`, ...) as targets, and their hammerids after `ent_keyvalue`.
+- **The status bar** explains map names and hammerids. Put the cursor on `418237` in a Hydro script and it says *tc_hydro entity – trigger_multiple at 1664 2088 24*.
+- **The checker** flags targets that neither the script nor the map has (usually a typo or a missing entity), and `ent_keyvalue` hammerids the map doesn't contain. Wildcards, `kill` on missing entities, and entities the game creates while running (`spotlight_end`, `tf_weapon_*`, ...) are left alone.
+- **Map entities... (`Ctrl+M`)**, or **map** in the status bar, opens a searchable list of the map's entities with class, hammerid, origin and outputs. You can insert a name, hammerid or origin from it, and choose which map the script is for when the folder name doesn't say (scripts in `Any`, for example).
 
 ### Coordinates
 
@@ -143,6 +169,9 @@ To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `
 | `Ctrl+T` | Insert `Test_Wait .1` |
 | `Ctrl+I` | Insert next free hammerid |
 | `Ctrl+P` | Coordinates (getpos → origin / setpos) |
+| `Ctrl+M` | Map entities |
+| `` Ctrl+` `` | Game console |
+| `Ctrl+Shift+P` | Position from game |
 | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Number under the cursor +1 / −1 (add `Shift` for ±10) |
 | `F9` | Run in game (save, then launch TF2 or send to the running game) |
 | `Ctrl+F9` | Copy the `test_startscript` command only |
@@ -163,7 +192,10 @@ To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `
 |---|---|
 | `testscript_pad.py` | the editor window |
 | `tslang.py` | the testscript language: vocabulary, highlighting, autocomplete context, checker |
+| `mapdata.py` | reads the entity list out of `.bsp` map files |
+| `gamelink.py`, `rcon.py` | the connection to a running TF2 (RCON) |
 | `Testscript-Pad.bat` | Windows launcher |
+| `build.bat`, `tools/make_icon.py`, `assets/icon.ico` | building the `.exe` |
 
 Settings are stored in `%APPDATA%\Testscript-Pad\settings.json`.
 

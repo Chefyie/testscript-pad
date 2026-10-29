@@ -6,12 +6,16 @@ Run:  pythonw testscript_pad.py [files...]
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 
+import gamelink
+import mapdata
+import rcon
 import tslang
 
 APP_NAME = 'Testscript-Pad'
@@ -180,6 +184,7 @@ class Settings:
         'run_template': 'test_startscript {path}',
         'game_dir': '', 'launch_options': tslang.DEFAULT_LAUNCH_OPTIONS, 'launch_map': '',
         'fallback_map': 'ctf_2fort', 'launch_wait_s': 20, 'reuse_game': True,
+        'script_maps': {}, 'game_link': True, 'rcon_password': '',
     }
 
     def __init__(self):
@@ -496,7 +501,7 @@ class Editor(ttk.Frame):
 
     def _run_analysis(self):
         self._an_job = None
-        a = tslang.analyze(self.get_text())
+        a = tslang.analyze(self.get_text(), self.app.mapinfo_for(self))
         self.analysis = a
         aliases = a.alias_names()
         if aliases != self.aliases or a.end_line != self.end_line:
@@ -589,16 +594,25 @@ class Editor(ttk.Frame):
         if kind == 'alias':
             a = self.analysis.aliases.get(word.lower())
             return f'alias {word} = {a[1]}' if a else ''
-        if kind in ('target', 'targetdef'):
+        mi = self.analysis.map
+        if kind in ('target', 'targetdef', 'entity'):
             defs = self.analysis.names.get(word)
             if defs:
                 return f'{word}: named on line ' + ', '.join(str(d[0]) for d in defs[:6])
-            return ''
+            ents = mi.by_name.get(word.lower()) if mi else None
+            if ents:
+                more = f' (+{len(ents) - 1} more with this name)' if len(ents) > 1 else ''
+                return f'{word}: {mi.name} entity - {ents[0].describe()}, hammerid {ents[0].hammerid}{more}'
+            if kind != 'entity':
+                return ''
         if kind == 'hammerid':
             h = self.analysis.hammerids.get(word)
             if h:
                 who = h.get('name') or h.get('cls_new') or h.get('cls')
                 return f'hammerid {word}: {who} (assigned on line {h["line"]})'
+            e = mi.by_hammerid.get(word) if mi else None
+            if e:
+                return f'hammerid {word}: {mi.name} entity - {e.describe()}'
             return f'hammerid {word}: map entity (not assigned in this script)'
         found = tslang.lookup_help(kind, word)
         if found:
@@ -672,7 +686,7 @@ class Editor(ttk.Frame):
         if kind == 'command':
             out = sorted(a.aliases) + list(tslang.COMMANDS) + tslang.COMMON_CVARS
         elif kind == 'target':
-            out = names + tslang.SPECIAL_TARGETS + sorted(tslang.ENTITIES)
+            out = names + (a.map.names if a.map else []) + tslang.SPECIAL_TARGETS + sorted(tslang.ENTITIES)
         elif kind == 'entity':
             out = sorted(tslang.ENTITIES)
         elif kind == 'input':
@@ -681,6 +695,8 @@ class Editor(ttk.Frame):
             out = sorted(tslang.KEYVALUES, key=str.lower) + list(tslang.OUTPUTS)
         elif kind == 'hammerid':
             out = sorted(a.hammerids, key=lambda k: int(k) if k.isdigit() else 0)
+            if a.map:
+                out += [e.hammerid for e in a.map.entities if e.targetname and e.hammerid]
         elif kind == 'model':
             out = sorted(a.models) + [m for m in tslang.COMMON_MODELS if m not in a.models]
         else:
@@ -1131,13 +1147,15 @@ class CoordDialog(Dialog):
         self.name = tk.StringVar(value=editor.word_under_cursor() if editor.word_under_cursor() in names else
                                  (names[0] if names else 'my_entity'))
 
-        ttk.Label(b, text='Paste getpos output (type getpos in the console, copy the setpos... line)').grid(
-            row=0, column=0, columnspan=7, sticky='w')
+        ttk.Label(b, text='Paste getpos output, or click From game to read your position from TF2').grid(
+            row=0, column=0, columnspan=8, sticky='w')
         pe = ttk.Entry(b, textvariable=self.paste, width=70)
         pe.grid(row=1, column=0, columnspan=5, sticky='ew', pady=(2, 8))
         ttk.Button(b, text='Paste', command=self.paste_clipboard).grid(row=1, column=5, padx=(6, 0), pady=(2, 8))
         ttk.Button(b, text='From line', command=self.from_line).grid(row=1, column=6, padx=(6, 0), pady=(2, 8))
         Tooltip(b.grid_slaves(row=1, column=6)[0], 'Read the origin/angles on the cursor line', app)
+        ttk.Button(b, text='From game', command=self.from_game).grid(row=1, column=7, padx=(6, 0), pady=(2, 8))
+        Tooltip(b.grid_slaves(row=1, column=7)[0], 'Ask the running game where you are (getpos)', app)
 
         for r, (label, vars_, heads) in enumerate((
                 ('Position', self.pos, ('X', 'Y', 'Z')),
@@ -1198,6 +1216,17 @@ class CoordDialog(Dialog):
             self.paste.set(self.clipboard_get().strip())
         except tk.TclError:
             pass
+
+    def from_game(self):
+        try:
+            text = self.app.game_command('getpos')
+        except rcon.RconError as e:
+            messagebox.showwarning(APP_NAME, f"Couldn't read your position from TF2:\n\n{e}", parent=self)
+            return
+        if 'setpos' not in text:
+            messagebox.showwarning(APP_NAME, f'TF2 answered something unexpected:\n\n{text[:300]}', parent=self)
+            return
+        self.paste.set(text.strip())
 
     def from_line(self, quiet=False):
         line = self.ed.text.get('insert linestart', 'insert lineend')
@@ -1322,8 +1351,13 @@ class GameSettingsDialog(Dialog):
         ttk.Spinbox(b, from_=0, to=120, increment=1, textvariable=self.wait, width=6).grid(
             row=r, column=1, sticky='w', padx=6, pady=2)
         r += 1
-        ttk.Checkbutton(b, text='If the game is already running, run the script in it (-hijack)',
+        ttk.Checkbutton(b, text='If the game is already running, run the script in it',
                         variable=self.reuse).grid(row=r, column=0, columnspan=3, sticky='w', pady=(8, 2))
+        r += 1
+        self.link = tk.BooleanVar(value=st['game_link'])
+        ttk.Checkbutton(b, text='Game link: start TF2 with RCON on (-usercon, console log, a private password) '
+                                'for the game console and "From game"',
+                        variable=self.link).grid(row=r, column=0, columnspan=3, sticky='w', pady=2)
         r += 1
         ttk.Label(b, text='Console command copied to the clipboard  ({path} = path from testscripts, {name} = file name)').grid(
             row=r, column=0, columnspan=3, sticky='w', pady=(10, 0))
@@ -1377,10 +1411,234 @@ class GameSettingsDialog(Dialog):
         st['fallback_map'] = self.fallback.get().strip()
         st['launch_wait_s'] = wait
         st['reuse_game'] = self.reuse.get()
+        st['game_link'] = self.link.get()
         st['run_template'] = self.template.get().strip() or 'test_startscript {path}'
         st.save()
         self.app.set_status_message('Game settings saved')
         self.destroy()
+
+
+class MapWindow(Dialog):
+    """Browse the entities of the script's map; pick which map the script is for."""
+
+    AUTO = '(auto - from the script folder)'
+    NONE = '(no map)'
+
+    def __init__(self, app, editor):
+        super().__init__(app, 'Map entities')
+        self.geometry('980x600')
+        self.ed = editor
+        b = self.body
+        top = ttk.Frame(b)
+        top.pack(fill='x')
+        ttk.Label(top, text='Map for this script').pack(side='left')
+        self.map_var = tk.StringVar()
+        self.map_box = ttk.Combobox(top, textvariable=self.map_var, width=30, state='readonly')
+        self.map_box.pack(side='left', padx=6)
+        self.map_box.bind('<<ComboboxSelected>>', lambda e: self.choose_map())
+        self.info = ttk.Label(top, text='')
+        self.info.pack(side='left', padx=10)
+        sf = ttk.Frame(b)
+        sf.pack(fill='x', pady=(8, 0))
+        ttk.Label(sf, text='Search').pack(side='left')
+        self.q = tk.StringVar()
+        qe = ttk.Entry(sf, textvariable=self.q)
+        qe.pack(side='left', fill='x', expand=True, padx=6)
+        self.named_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(sf, text='Named only', variable=self.named_only, command=self.fill).pack(side='left')
+
+        tf = ttk.Frame(b)
+        tf.pack(fill='both', expand=True, pady=(6, 0))
+        cols = ('cls', 'hid', 'origin')
+        self.tree = ttk.Treeview(tf, columns=cols, show='tree headings', selectmode='browse')
+        for c, (title, w) in zip(('#0',) + cols, (('Name', 220), ('Class', 220), ('Hammer ID', 90), ('Origin', 220))):
+            self.tree.heading(c, text=title, anchor='w')
+            self.tree.column(c, width=w, stretch=c in ('#0', 'origin'))
+        sb = ttk.Scrollbar(tf, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='left', fill='y')
+        self.tree.bind('<Double-1>', lambda e: self.insert('name'))
+        self.tree.bind('<<TreeviewSelect>>', lambda e: self.show_outputs())
+        self.outputs = ttk.Label(b, text='', wraplength=940, justify='left')
+        self.outputs.pack(fill='x', pady=(6, 0))
+        bf = ttk.Frame(b)
+        bf.pack(fill='x', pady=(8, 0))
+        ttk.Button(bf, text='Insert name', command=lambda: self.insert('name')).pack(side='left')
+        ttk.Button(bf, text='Insert hammerid', command=lambda: self.insert('hid')).pack(side='left', padx=6)
+        ttk.Button(bf, text='Insert origin', command=lambda: self.insert('origin')).pack(side='left')
+        ttk.Label(bf, text='Double-click inserts the name (or the hammerid when it has none)').pack(side='left', padx=12)
+        ttk.Button(bf, text='Close', command=self.destroy).pack(side='right')
+        self.q.trace_add('write', lambda *_: self.fill())
+        self._rows = {}
+        self.refresh_maps()
+        self.center()
+        qe.focus_set()
+
+    def refresh_maps(self):
+        maps = self.app.installed_maps(self.app.game_dir_for(self.ed.path or ''))
+        self.map_box.configure(values=[self.AUTO, self.NONE] + maps)
+        choice = self.app.script_map_choice(self.ed)
+        self.map_var.set({None: self.AUTO, '': self.NONE}.get(choice, choice))
+        self.fill()
+
+    def choose_map(self):
+        v = self.map_var.get()
+        self.app.set_script_map(self.ed, {self.AUTO: None, self.NONE: ''}.get(v, v))
+        self.fill()
+
+    def fill(self):
+        self.tree.delete(*self.tree.get_children())
+        self._rows = {}
+        mi = self.app.mapinfo_for(self.ed)
+        if mi is None:
+            why = 'save the script under tf\\testscripts and set the game folder' if not self.ed.path else \
+                'no map picked for this script - choose one above'
+            self.info.configure(text=why)
+            return
+        self.info.configure(text=f'{len(mi.entities)} entities, {len(mi.names)} named')
+        q = self.q.get().lower()
+        n = 0
+        for e in sorted(mi.entities, key=lambda e: (not e.targetname, e.targetname.lower(), e.classname)):
+            if self.named_only.get() and not e.targetname:
+                continue
+            if q and q not in e.targetname.lower() and q not in e.classname.lower() and q not in e.hammerid:
+                continue
+            iid = self.tree.insert('', 'end', text=e.targetname, values=(e.classname, e.hammerid, e.origin))
+            self._rows[iid] = e
+            n += 1
+            if n >= 3000:
+                break
+
+    def selected(self):
+        sel = self.tree.selection()
+        return self._rows.get(sel[0]) if sel else None
+
+    def show_outputs(self):
+        e = self.selected()
+        if not e or not e.outputs:
+            self.outputs.configure(text='')
+            return
+        shown = '   '.join(f'{k} {v}' for k, v in e.outputs[:6])
+        more = f'   (+{len(e.outputs) - 6} more)' if len(e.outputs) > 6 else ''
+        self.outputs.configure(text=f'Outputs: {shown}{more}')
+
+    def insert(self, what):
+        e = self.selected()
+        if not e:
+            return
+        if what == 'name':
+            text = e.targetname or e.hammerid
+        elif what == 'hid':
+            text = e.hammerid
+        else:
+            text = e.origin
+        if text:
+            self.ed.text.insert('insert', text)
+            self.ed.text.focus_set()
+
+
+class ConsoleWindow(Dialog):
+    """Live view of the game's console (tf/console.log) plus a command line sent over RCON."""
+
+    def __init__(self, app):
+        super().__init__(app, 'Game console')
+        self.geometry('900x520')
+        self.resizable(True, True)
+        b = self.body
+        self.out = tk.Text(b, wrap='word', font=app.font, state='disabled', **app.text_opts())
+        sb = ttk.Scrollbar(b, orient='vertical', command=self.out.yview)
+        self.out.configure(yscrollcommand=sb.set)
+        self.out.grid(row=0, column=0, sticky='nsew')
+        sb.grid(row=0, column=1, sticky='ns')
+        t = app.theme
+        self.out.tag_configure('cmd', foreground=t['accent'])
+        self.out.tag_configure('reply', foreground=t['ok'])
+        self.out.tag_configure('note', foreground=t['muted'])
+        self.out.tag_configure('err', foreground=t['error'])
+        row = ttk.Frame(b)
+        row.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(8, 0))
+        ttk.Label(row, text=']').pack(side='left')
+        self.cmd = tk.StringVar()
+        e = ttk.Entry(row, textvariable=self.cmd, font=app.font)
+        e.pack(side='left', fill='x', expand=True, padx=6)
+        ttk.Button(row, text='Send', command=self.send).pack(side='left')
+        ttk.Button(row, text='Clear', command=self.clear).pack(side='left', padx=(6, 0))
+        b.rowconfigure(0, weight=1)
+        b.columnconfigure(0, weight=1)
+        e.bind('<Return>', lambda ev: self.send())
+        e.bind('<Up>', lambda ev: self.history_step(-1))
+        e.bind('<Down>', lambda ev: self.history_step(1))
+        self.history, self.hpos = [], 0
+        self.log_path = self.app.console_log_path()
+        self.log_pos = None
+        if self.log_path and os.path.isfile(self.log_path):
+            self.log_pos = max(0, os.path.getsize(self.log_path) - 20000)   # show the recent tail
+            self.write(f'Showing {self.log_path}\n', 'note')
+        else:
+            self.write('No console log yet - start TF2 with F9 so it writes tf\\console.log.\n'
+                       'Commands typed below still work once the game is linked.\n', 'note')
+        self.center()
+        e.focus_set()
+        self.poll()
+
+    def write(self, text, tag=None):
+        at_end = self.out.yview()[1] >= 0.999
+        self.out.configure(state='normal')
+        self.out.insert('end', text, tag or ())
+        lines = int(self.out.index('end-1c').split('.')[0])
+        if lines > 5000:
+            self.out.delete('1.0', f'{lines - 5000}.0')
+        self.out.configure(state='disabled')
+        if at_end:
+            self.out.see('end')
+
+    def clear(self):
+        self.out.configure(state='normal')
+        self.out.delete('1.0', 'end')
+        self.out.configure(state='disabled')
+
+    def poll(self):
+        if not self.winfo_exists():
+            return
+        path = self.app.console_log_path()
+        if path and path != self.log_path:
+            self.log_path, self.log_pos = path, 0
+        if self.log_path and os.path.isfile(self.log_path):
+            size = os.path.getsize(self.log_path)
+            if self.log_pos is None or size < self.log_pos:
+                self.log_pos = 0           # the game started a new log
+            if size > self.log_pos:
+                with open(self.log_path, 'rb') as f:
+                    f.seek(self.log_pos)
+                    data = f.read(size - self.log_pos)
+                self.log_pos = size
+                self.write(data.decode('utf-8', 'replace').replace('\r\n', '\n'))
+        self.after(400, self.poll)
+
+    def history_step(self, step):
+        if not self.history:
+            return 'break'
+        self.hpos = max(0, min(len(self.history), self.hpos + step))
+        self.cmd.set(self.history[self.hpos] if self.hpos < len(self.history) else '')
+        return 'break'
+
+    def send(self):
+        cmd = self.cmd.get().strip()
+        if not cmd:
+            return
+        self.history.append(cmd)
+        self.hpos = len(self.history)
+        self.cmd.set('')
+        self.write(f'] {cmd}\n', 'cmd')
+        try:
+            reply = self.app.game_command(cmd)
+        except rcon.RconError as e:
+            self.write(f'{e}\n', 'err')
+            return
+        # output of RCON commands only comes back here, it isn't written to console.log
+        if reply:
+            self.write(reply if reply.endswith('\n') else reply + '\n', 'reply')
 
 
 class FindDialog(Dialog):
@@ -1569,8 +1827,13 @@ class App:
         self.root.title(APP_NAME)
         self.root.geometry(self.settings['geometry'])
         self.root.minsize(700, 400)
+        icon = os.path.join(getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))),
+                            'assets', 'icon.ico')
         try:
-            self.root.iconphoto(True, self._make_icon())
+            if sys.platform == 'win32' and os.path.isfile(icon):
+                self.root.iconbitmap(default=icon)     # also used by every dialog
+            else:
+                self.root.iconphoto(True, self._make_icon())
         except tk.TclError:
             pass
         self.last_find = ''
@@ -1761,16 +2024,22 @@ class App:
         # status bar
         self.status = ttk.Frame(root, style='Status.TFrame')
         self.status.pack(side='bottom', fill='x')
-        self.status_help = ttk.Label(self.status, text='', style='Status.TLabel', anchor='w')
-        self.status_help.pack(side='left', fill='x', expand=True)
         self.status_parts = {}
-        for key in ('eol', 'pos', 'hid', 'counts'):
+        # right-hand parts are packed first so a long help text can't squeeze them out
+        for key in ('eol', 'pos', 'hid', 'map', 'game', 'counts'):
             lbl = ttk.Label(self.status, text='', style='Status.TLabel')
             lbl.pack(side='right')
             self.status_parts[key] = lbl
+        self.status_help = ttk.Label(self.status, text='', style='Status.TLabel', anchor='w', width=1)
+        self.status_help.pack(side='left', fill='x', expand=True)
         self.status_parts['counts'].bind('<Button-1>', lambda e: self.next_problem(1))
         Tooltip(self.status_parts['counts'], 'Errors / warnings / notes - click to go to the next one', self)
         Tooltip(self.status_parts['hid'], 'Next free hammerid (Ctrl+I inserts it)', self)
+        self.status_parts['map'].bind('<Button-1>', lambda e: self.map_window())
+        self.status_parts['game'].configure(text='game not linked')
+        self.status_parts['game'].bind('<Button-1>', lambda e: self.link_game())
+        Tooltip(self.status_parts['game'], 'Connection to TF2 (RCON) - click to connect to a running game', self)
+        Tooltip(self.status_parts['map'], 'Map this script is checked against - click to browse or change it', self)
 
         # toolbar
         self.toolbar = ttk.Frame(root, style='Toolbar.TFrame', padding=(4, 2))
@@ -1785,6 +2054,7 @@ class App:
             ('+ Alias', self.insert_alias, 'Insert an alias'),
             None,
             ('+ Coords', self.coord_dialog, 'Turn getpos output into origin / setpos text (Ctrl+P)'),
+            ('Map', lambda: self.map_window(), 'Browse the map\'s entities and pick the script\'s map (Ctrl+M)'),
             None,
             ('▶ Run', self.run_in_game, 'Save and run in TF2 (F9) - set the game folder under Tools > Game settings'),
             ('Check', self.check_now, 'Check the script for problems (F5)'),
@@ -2039,7 +2309,11 @@ class App:
         tl.add_command(label='Run in game', accelerator='F9', command=self.run_in_game)
         tl.add_command(label='Copy run command', accelerator='Ctrl+F9', command=self.copy_run_command)
         tl.add_command(label='Game settings...', command=self.game_settings)
+        tl.add_command(label='Game console', accelerator='Ctrl+`', command=self.console_window)
+        tl.add_command(label='Position from game', accelerator='Ctrl+Shift+P', command=self.position_from_game)
+        tl.add_command(label='Connect to running game', command=self.link_game)
         tl.add_separator()
+        tl.add_command(label='Map entities...', accelerator='Ctrl+M', command=self.map_window)
         tl.add_command(label='Coordinates...', accelerator='Ctrl+P', command=self.coord_dialog)
         tl.add_command(label='Number +1', accelerator='Ctrl+Alt+Up', command=lambda: self._ed('nudge', 1))
         tl.add_command(label='Number -1', accelerator='Ctrl+Alt+Down', command=lambda: self._ed('nudge', -1))
@@ -2094,7 +2368,8 @@ class App:
             '<F8>': lambda: self.next_problem(1), '<Shift-F8>': lambda: self.next_problem(-1),
             '<F2>': self.rename_symbol, '<F1>': lambda: ReferenceWindow(self),
             '<F9>': self.run_in_game, '<Control-F9>': self.copy_run_command,
-            '<Control-p>': self.coord_dialog,
+            '<Control-p>': self.coord_dialog, '<Control-m>': self.map_window,
+            '<Control-grave>': self.console_window, '<Control-P>': self.position_from_game,
             '<Control-equal>': lambda: self.zoom(1), '<Control-plus>': lambda: self.zoom(1),
             '<Control-minus>': lambda: self.zoom(-1), '<Control-0>': lambda: self.zoom(0),
             '<Control-Tab>': lambda: self.cycle_tab(1), '<Control-Shift-Tab>': lambda: self.cycle_tab(-1),
@@ -2448,6 +2723,19 @@ class App:
         ed = self.current()
         if not ed:
             return None
+        ed._run_analysis()
+        if ed.analysis.end_line is None and ed.get_text().strip():
+            add = messagebox.askyesnocancel(
+                APP_NAME, "This script doesn't end with '///', so its last lines won't run correctly.\n\n"
+                          "Add '///' at the end now?", parent=self.root)
+            if add is None:
+                return None
+            if add:
+                t = ed.text
+                begin_undo(t)
+                t.insert('end-1c', ('' if ed.get_text().endswith('\n') else '\n') + '///\n')
+                end_undo(t)
+                ed._run_analysis()
         if (ed.modified or not ed.path) and not self.save(ed):
             return None
         rel = tslang.testscript_relpath(ed.path)
@@ -2466,6 +2754,42 @@ class App:
         self.root.clipboard_clear()
         self.root.clipboard_append(cmd)
         self.set_status_message(f'Copied  {cmd}  - paste it into the TF2 console')
+
+    def _map_key(self, ed):
+        return os.path.normcase(os.path.abspath(ed.path)) if ed.path else None
+
+    def script_map_choice(self, ed):
+        """The map picked for this script: a map name, '' for none, or None for automatic."""
+        key = self._map_key(ed)
+        return self.settings['script_maps'].get(key) if key else None
+
+    def set_script_map(self, ed, choice):
+        key = self._map_key(ed)
+        if not key:
+            return
+        maps = dict(self.settings['script_maps'])
+        if choice is None:
+            maps.pop(key, None)
+        else:
+            maps[key] = choice
+        self.settings['script_maps'] = maps
+        ed._run_analysis()
+
+    def mapinfo_for(self, ed):
+        """MapInfo for the script's map (picked, or guessed from its folder), or None."""
+        if not ed.path:
+            return None
+        game_dir = self.game_dir_for(ed.path)
+        choice = self.script_map_choice(ed)
+        if choice is None:
+            rel = tslang.testscript_relpath(ed.path)
+            choice = tslang.guess_map(rel, self.installed_maps(game_dir)) if rel else None
+        return mapdata.load_map(game_dir, choice) if choice else None
+
+    def map_window(self):
+        ed = self.current()
+        if ed:
+            MapWindow(self, ed)
 
     def game_dir_for(self, path):
         return self.settings['game_dir'].strip() or tslang.game_dir_from_script(path) or ''
@@ -2507,12 +2831,22 @@ class App:
             return
 
         if st['reuse_game'] and self.game_running():
+            if st['game_link']:
+                try:
+                    self.game_command(cmd)
+                    self.set_status_message(f'Ran {rel} in TF2 over the game link   (also copied: {cmd})')
+                    return
+                except rcon.RconError:
+                    pass        # e.g. started from client.bat without -usercon: fall back to -hijack
             args = f'"{hl2}" -hijack -game tf +{cmd}'
             what = 'Sent to the running game'
         else:
             map_name = None
             if st['launch_map'] == '':
-                map_name = tslang.guess_map(rel, self.installed_maps(game_dir)) or st['fallback_map'] or None
+                choice = self.script_map_choice(ed)
+                if choice is None:
+                    choice = tslang.guess_map(rel, self.installed_maps(game_dir))
+                map_name = choice or st['fallback_map'] or None
             elif st['launch_map'] != '-':
                 map_name = st['launch_map']
             if map_name:
@@ -2528,7 +2862,10 @@ class App:
             else:
                 script_arg = rel
                 what = f'Launching TF2 with {rel}'
-            args = f'"{hl2}" {tslang.launch_options(st["launch_options"])} -testscript "{script_arg}"'
+            options = tslang.launch_options(st['launch_options'])
+            if st['game_link']:
+                options = gamelink.link_options(options, self.rcon_password())
+            args = f'"{hl2}" {options} -testscript "{script_arg}"'
         try:
             subprocess.Popen(args, cwd=game_dir)
         except OSError as e:
@@ -2539,6 +2876,60 @@ class App:
     def game_settings(self):
         ed = self.current()
         GameSettingsDialog(self, ed.path if ed else None)
+
+    # -- game link (RCON) -------------------------------------------------
+    def rcon_password(self):
+        if not self.settings['rcon_password']:
+            self.settings['rcon_password'] = secrets.token_hex(8)
+            self.settings.save()
+        return self.settings['rcon_password']
+
+    def game_command(self, cmd):
+        """Run a console command in the running TF2 and return its output (raises rcon.RconError)."""
+        port = gamelink.port_from_options(self.settings['launch_options'])
+        link = getattr(self, 'link', None)
+        if link is None or link.port != port or link.password != self.rcon_password():
+            if link is not None:
+                link.close()
+            link = self.link = gamelink.GameLink(self.rcon_password(), port)
+        try:
+            out = link.command(cmd)
+        except rcon.RconError:
+            self._set_link_status(False)
+            raise
+        self._set_link_status(True)
+        return out
+
+    def _set_link_status(self, ok):
+        lbl = self.status_parts.get('game')
+        if lbl is not None:
+            lbl.configure(text='game linked' if ok else 'game not linked')
+
+    def link_game(self):
+        try:
+            out = self.game_command('status')
+            m = re.search(r'map\s*:\s*(\S+)', out)
+            self.set_status_message(f"Linked to TF2{' on ' + m.group(1) if m else ''}")
+        except rcon.RconError as e:
+            self.set_status_message(f'Game link: {e}')
+
+    def console_log_path(self):
+        ed = self.current()
+        game_dir = self.game_dir_for(ed.path) if ed and ed.path else self.settings['game_dir'].strip()
+        return os.path.join(game_dir, 'tf', 'console.log') if game_dir else None
+
+    def console_window(self):
+        if getattr(self, '_console', None) is not None and self._console.winfo_exists():
+            self._console.lift()
+            return
+        self._console = ConsoleWindow(self)
+
+    def position_from_game(self):
+        ed = self.current()
+        if ed:
+            ed._run_analysis()
+            d = CoordDialog(self, ed)
+            d.from_game()
 
     def insert_hammerid(self):
         ed = self.current()
@@ -2663,6 +3054,9 @@ class App:
             'Ctrl+T       Insert Test_Wait .1',
             'Ctrl+I       Insert next free hammerid',
             'Ctrl+P       Coordinates (getpos -> origin / setpos)',
+            'Ctrl+M       Map entities (browse the map, pick the script\'s map)',
+            'Ctrl+`       Game console (live TF2 console + commands)',
+            'Ctrl+Shift+P Position from game (getpos into the coordinate dialog)',
             'Ctrl+Alt+Up/Down  Number under cursor +1 / -1 (add Shift for 10)',
             'F9           Run in game (save, then launch TF2 or send to the running game)',
             'Ctrl+F9      Copy the test_startscript command only',
@@ -2754,6 +3148,7 @@ class App:
         sp = self.status_parts
         sp['counts'].configure(text=f"✖ {c['error']}   ▲ {c['warning']}   ● {c['info']}")
         sp['hid'].configure(text=f'hammerid {ed.analysis.next_hammerid()}')
+        sp['map'].configure(text=f'map {ed.analysis.map.name}' if ed.analysis.map else 'no map')
         sp['pos'].configure(text=f'Ln {ln}, Col {int(col) + 1}')
         enc = 'UTF-8' if ed.encoding.startswith('utf') else 'ANSI'
         sp['eol'].configure(text=f"{enc}   {'CRLF' if ed.newline == chr(13) + chr(10) else 'LF'}")
