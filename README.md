@@ -133,4 +133,4 @@ To teach the editor new commands, inputs, outputs, keyvalues or entity classes, 
 
 ## License
 
-[MIT](LICENSE) © 2026 RageTails
+[MIT](LICENSE) © 2026 Chefy
