@@ -3,12 +3,15 @@
 Run:  pythonw testscript_pad.py [files...]
 """
 
+import glob
 import json
 import os
 import re
 import secrets
 import subprocess
 import sys
+import time
+import uuid
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
@@ -22,6 +25,8 @@ APP_NAME = 'Testscript-Pad'
 VERSION = '1.0'
 CONFIG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), APP_NAME)
 CONFIG_PATH = os.path.join(CONFIG_DIR, 'settings.json')
+BACKUP_DIR = os.path.join(CONFIG_DIR, 'backups')
+BACKUP_SECONDS = 30
 DEFAULT_DIR = r'D:\Games\game\tf\testscripts'
 FILETYPES = [('Testscripts', '*.txt'), ('All files', '*.*')]
 
@@ -175,6 +180,60 @@ class Tooltip:
             self.win = None
 
 
+class TreeTooltip:
+    """Shows the full text of a Treeview row when it doesn't fit its column."""
+
+    def __init__(self, tree, app, column='#0'):
+        self.tree, self.app, self.column = tree, app, column
+        self.win = None
+        self.row = None
+        tree.bind('<Motion>', self._motion, add=True)
+        tree.bind('<Leave>', lambda e: self._hide(), add=True)
+        tree.bind('<Button>', lambda e: self._hide(), add=True)
+
+    def _text(self, row):
+        if self.column == '#0':
+            return self.tree.item(row, 'text')
+        return str(self.tree.set(row, self.column))
+
+    def _motion(self, event):
+        row = self.tree.identify_row(event.y)
+        if row == self.row:
+            return
+        self._hide()
+        self.row = row
+        if not row:
+            return
+        text = self._text(row)
+        bbox = self.tree.bbox(row, self.column)
+        if not text or not bbox:
+            return
+        indent = 20 * (len(self._ancestors(row)) + 1) if self.column == '#0' else 8
+        if self.app.ui_font.measure(text) + indent <= bbox[2]:
+            return          # fits, no tooltip needed
+        t = self.app.theme
+        self.win = tk.Toplevel(self.tree)
+        self.win.wm_overrideredirect(True)
+        self.win.attributes('-topmost', True)
+        tk.Label(self.win, text=text, bg=t['panel_bg'], fg=t['panel_fg'], font=self.app.ui_font,
+                 padx=8, pady=3, highlightthickness=1, highlightbackground=t['border']).pack()
+        self.win.geometry(f'+{event.x_root + 14}+{event.y_root + 12}')
+
+    def _ancestors(self, row):
+        out = []
+        while True:
+            row = self.tree.parent(row)
+            if not row:
+                return out
+            out.append(row)
+
+    def _hide(self):
+        if self.win is not None:
+            self.win.destroy()
+            self.win = None
+        self.row = None
+
+
 class Settings:
     DEFAULTS = {
         'theme': 'dark', 'font_family': 'Consolas', 'font_size': 11, 'recent': [],
@@ -185,7 +244,8 @@ class Settings:
         'game_dir': '', 'launch_options': tslang.DEFAULT_LAUNCH_OPTIONS, 'launch_map': '',
         'fallback_map': 'ctf_2fort', 'launch_wait_s': 20, 'reuse_game': True,
         'script_maps': {}, 'game_link': True, 'rcon_password': '',
-        'skip_waiting': True, 'auto_team': 'auto', 'auto_class': 'scout',
+        'skip_waiting': True, 'auto_team': 'auto', 'auto_class': 'scout', 'show_timing': True,
+        'hover_help': True, 'snippets': [],
     }
 
     def __init__(self):
@@ -306,6 +366,8 @@ class Editor(ttk.Frame):
         self._cursor_job = None
         self._hl_progress = None
         self._modified = False
+        self.backup_id = uuid.uuid4().hex
+        self._backup_text = None
 
         self.gutter = tk.Canvas(self, width=48, highlightthickness=0, borderwidth=0)
         self.text = tk.Text(self, wrap='none', undo=True, maxundo=-1, autoseparators=True,
@@ -340,6 +402,14 @@ class Editor(ttk.Frame):
         t.bind('<Control-space>', lambda e: (self.complete(force=True), 'break')[1])
         t.bind('<FocusOut>', lambda e: self.after(150, self._maybe_hide_completer))
         t.bind('<Button-1>', lambda e: self.completer.hide(), add=True)
+        self._hover_job = None
+        self._hover_win = None
+        self._hover_at = None
+        t.bind('<Motion>', self._on_motion, add=True)
+        t.bind('<Leave>', lambda e: self._hide_hover(), add=True)
+        t.bind('<KeyPress>', lambda e: self._hide_hover(), add=True)
+        t.bind('<Button>', lambda e: self._hide_hover(), add=True)
+        t.bind('<MouseWheel>', lambda e: self._hide_hover(), add=True)
         t.bind('<Configure>', lambda e: self.schedule_gutter())
         t.bind('<Control-MouseWheel>', self._ctrl_wheel)
         self.gutter.bind('<Button-1>', self._gutter_click)
@@ -397,6 +467,35 @@ class Editor(ttk.Frame):
     def set_saved(self):
         self._modified = False
         self.app.update_tab_title(self)
+        self.remove_backup()
+
+    @property
+    def backup_path(self):
+        return os.path.join(BACKUP_DIR, self.backup_id + '.json')
+
+    def write_backup(self):
+        """Copy unsaved text to the backup folder (only when it changed since the last backup)."""
+        text = self.get_text()
+        if not self._modified or text == self._backup_text:
+            return
+        data = {'path': self.path, 'title': self.title, 'text': text, 'encoding': self.encoding,
+                'newline': self.newline, 'saved_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            tmp = self.backup_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp, self.backup_path)
+            self._backup_text = text
+        except OSError:
+            pass
+
+    def remove_backup(self):
+        self._backup_text = None
+        try:
+            os.remove(self.backup_path)
+        except OSError:
+            pass
 
     @property
     def title(self):
@@ -539,11 +638,15 @@ class Editor(ttk.Frame):
         t = self.app.theme
         f = self.app.font
         digits = max(3, len(str(self.line_count())))
-        width = f.measure('9' * digits) + 22
+        times = self.analysis.line_times if self.app.settings['show_timing'] else {}
+        time_w = self.app.ui_font.measure('0:00.0') + 10 if times else 0
+        width = f.measure('9' * digits) + 22 + time_w
         if int(c.cget('width')) != width:
             c.configure(width=width)
         cur = int(self.text.index('insert').split('.')[0])
         idx = self.text.index('@0,0')
+        first = int(idx.split('.')[0])
+        prev_time = times.get(first - 1, 0.0)
         while True:
             info = self.text.dlineinfo(idx)
             if info is None:
@@ -552,6 +655,13 @@ class Editor(ttk.Frame):
             y = info[1]
             c.create_text(width - 6, y, anchor='ne', text=str(ln), font=f,
                           fill=t['gutter_cur'] if ln == cur else t['gutter_fg'])
+            when = times.get(ln)
+            if when is not None:
+                # show the time where it changes (after a Test_Wait), and on the cursor line
+                if (when != prev_time and when > 0) or (ln == cur and when > 0):
+                    c.create_text(14, y + 1, anchor='nw', text=tslang.format_time(when), font=self.app.ui_font,
+                                  fill=t['accent'] if when != prev_time else t['gutter_fg'])
+                prev_time = when
             sev = self.diag_lines.get(ln)
             if sev:
                 r = 3
@@ -584,6 +694,10 @@ class Editor(ttk.Frame):
 
     def cursor_help(self):
         ln, col = map(int, self.text.index('insert').split('.'))
+        return self.help_at(ln, col)
+
+    def help_at(self, ln, col):
+        """One-line explanation of the word at line ln, column col (problems first)."""
         line = self.text.get(f'{ln}.0', f'{ln}.end')
         for d in self.analysis.diagnostics:
             if d.line == ln and d.col <= col <= d.end:
@@ -599,7 +713,10 @@ class Editor(ttk.Frame):
         if kind in ('target', 'targetdef', 'entity'):
             defs = self.analysis.names.get(word)
             if defs:
-                return f'{word}: named on line ' + ', '.join(str(d[0]) for d in defs[:6])
+                lines = sorted({d[0] for d in defs})
+                uses = len({u[0] for u in tslang.find_uses(self.get_text(), word, self.aliases)})
+                return (f'{word}: named on line ' + ', '.join(map(str, lines[:6]))
+                        + f'  -  on {uses} line(s), Shift+F12 lists them')
             ents = mi.by_name.get(word.lower()) if mi else None
             if ents:
                 more = f' (+{len(ents) - 1} more with this name)' if len(ents) > 1 else ''
@@ -620,6 +737,48 @@ class Editor(ttk.Frame):
             name, desc = found
             return f'{name} - {desc}' if not desc.startswith(name) else desc
         return ''
+
+    # -- hover tooltips ---------------------------------------------------
+    def _on_motion(self, event):
+        idx = self.text.index(f'@{event.x},{event.y}')
+        box = self.text.bbox(idx)
+        over_text = box is not None and box[0] <= event.x <= box[0] + max(box[2], 1) + 2
+        ln, col = map(int, idx.split('.'))
+        line = self.text.get(f'{ln}.0', f'{ln}.end')
+        s = e = col
+        while s > 0 and line[s - 1] in tslang.WORD_CHARS:
+            s -= 1
+        while e < len(line) and line[e] in tslang.WORD_CHARS:
+            e += 1
+        key = (ln, s, e) if over_text and e > s else None
+        if key == self._hover_at:
+            return
+        self._hide_hover()
+        self._hover_at = key
+        if key is not None and self.app.settings['hover_help']:
+            self._hover_job = self.after(650, lambda: self._show_hover(ln, col, event.x_root, event.y_root))
+
+    def _show_hover(self, ln, col, x, y):
+        self._hover_job = None
+        text = self.help_at(ln, col)
+        if not text or self.completer.visible:
+            return
+        t = self.app.theme
+        self._hover_win = tk.Toplevel(self)
+        self._hover_win.wm_overrideredirect(True)
+        self._hover_win.attributes('-topmost', True)
+        tk.Label(self._hover_win, text=text, justify='left', wraplength=560, bg=t['panel_bg'], fg=t['panel_fg'],
+                 font=self.app.ui_font, padx=10, pady=6, highlightthickness=1,
+                 highlightbackground=t['border']).pack()
+        self._hover_win.geometry(f'+{x + 12}+{y + 18}')
+
+    def _hide_hover(self):
+        if self._hover_job is not None:
+            self.after_cancel(self._hover_job)
+            self._hover_job = None
+        if self._hover_win is not None:
+            self._hover_win.destroy()
+            self._hover_win = None
 
     # -- completion -------------------------------------------------------
     def _maybe_hide_completer(self):
@@ -1833,6 +1992,147 @@ class GameEntitiesWindow(Dialog):
             self.ed.text.focus_set()
 
 
+class UsesWindow(Dialog):
+    """Every line that names, fires at or mentions a name (Shift+F12)."""
+
+    def __init__(self, app, editor, name):
+        super().__init__(app, f'Uses of {name}')
+        self.geometry('900x420')
+        self.ed = editor
+        b = self.body
+        text = editor.get_text()
+        uses = tslang.find_uses(text, name, editor.aliases)
+        lines = text.split('\n')
+        kinds = {}
+        for u in uses:
+            kinds[u[3]] = kinds.get(u[3], 0) + 1
+        summary = ', '.join(f'{n} {k}' for k, n in kinds.items()) or 'not used in this script'
+        mi = editor.analysis.map
+        in_map = mi.by_name.get(name.lower()) if mi else None
+        if in_map:
+            summary += f'   -   also in {mi.name}: {in_map[0].describe()}'
+        ttk.Label(b, text=f"'{name}': {summary}", wraplength=860, justify='left').pack(anchor='w')
+        tf = ttk.Frame(b)
+        tf.pack(fill='both', expand=True, pady=(8, 0))
+        self.tree = ttk.Treeview(tf, columns=('line', 'kind', 'code'), show='headings', selectmode='browse')
+        for c, title, w, stretch in (('line', 'Line', 60, False), ('kind', 'What it does', 170, False),
+                                     ('code', 'Code', 600, True)):
+            self.tree.heading(c, text=title, anchor='w')
+            self.tree.column(c, width=w, stretch=stretch, anchor='e' if c == 'line' else 'w')
+        sb = ttk.Scrollbar(tf, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='left', fill='y')
+        self.tree.tag_configure('def', foreground=app.theme['accent'])
+        self._rows = {}
+        for ln, col, end, kind in uses:
+            code = lines[ln - 1].strip()
+            iid = self.tree.insert('', 'end', values=(ln, kind, code[:200]),
+                                   tags=('def',) if kind in ('names it', 'defines the alias') else ())
+            self._rows[iid] = (ln, col, end)
+        TreeTooltip(self.tree, app, column='code')
+        self.tree.bind('<<TreeviewSelect>>', lambda e: self.jump())
+        ttk.Label(b, text='Click a row to jump to it.').pack(anchor='w', pady=(6, 0))
+        self.center()
+
+    def jump(self):
+        sel = self.tree.selection()
+        if sel and sel[0] in self._rows:
+            ln, col, end = self._rows[sel[0]]
+            self.ed.goto_line(ln, col, end)
+
+
+class SnippetsWindow(Dialog):
+    """Edit, rename and delete saved snippets."""
+
+    def __init__(self, app):
+        super().__init__(app, 'My snippets')
+        self.geometry('860x480')
+        b = self.body
+        left = ttk.Frame(b)
+        left.pack(side='left', fill='y')
+        self.lb = tk.Listbox(left, width=28, exportselection=False, activestyle='none', font=app.ui_font,
+                             bg=app.theme['panel_bg'], fg=app.theme['panel_fg'], relief='flat',
+                             selectbackground=app.theme['select'], highlightthickness=1,
+                             highlightbackground=app.theme['border'])
+        self.lb.pack(fill='y', expand=True)
+        self.lb.bind('<<ListboxSelect>>', lambda e: self.show())
+        right = ttk.Frame(b)
+        right.pack(side='left', fill='both', expand=True, padx=(10, 0))
+        nf = ttk.Frame(right)
+        nf.pack(fill='x')
+        ttk.Label(nf, text='Name').pack(side='left')
+        self.name = tk.StringVar()
+        ttk.Entry(nf, textvariable=self.name).pack(side='left', fill='x', expand=True, padx=6)
+        self.body_text = tk.Text(right, font=app.font, undo=True, wrap='none', **app.text_opts())
+        self.body_text.pack(fill='both', expand=True, pady=(8, 0))
+        ttk.Label(right, text='{hid} becomes the next free hammerid when inserted ({hid+1}, {hid+2} ... for more).').pack(
+            anchor='w', pady=(6, 0))
+        bf = ttk.Frame(right)
+        bf.pack(fill='x', pady=(8, 0))
+        ttk.Button(bf, text='Save changes', command=self.save).pack(side='left')
+        ttk.Button(bf, text='Delete', command=self.delete).pack(side='left', padx=6)
+        ttk.Button(bf, text='Insert', command=self.insert).pack(side='left')
+        ttk.Button(bf, text='Close', command=self.destroy).pack(side='right')
+        self.fill()
+        self.center()
+
+    @property
+    def snippets(self):
+        return self.app.settings['snippets']
+
+    def fill(self, select=0):
+        self.lb.delete(0, 'end')
+        for snip in self.snippets:
+            self.lb.insert('end', snip['name'])
+        if self.snippets:
+            select = max(0, min(select, len(self.snippets) - 1))
+            self.lb.selection_set(select)
+            self.show()
+        else:
+            self.name.set('')
+            self.body_text.delete('1.0', 'end')
+            self.body_text.insert('1.0', 'No snippets yet. Select some lines in a script and use\n'
+                                         'Insert > My snippets > Save selection as snippet...')
+
+    def index(self):
+        sel = self.lb.curselection()
+        return sel[0] if sel else None
+
+    def show(self):
+        i = self.index()
+        if i is None:
+            return
+        self.name.set(self.snippets[i]['name'])
+        self.body_text.delete('1.0', 'end')
+        self.body_text.insert('1.0', self.snippets[i]['text'])
+
+    def save(self):
+        i = self.index()
+        if i is None:
+            return
+        snips = list(self.snippets)
+        snips[i] = {'name': self.name.get().strip() or snips[i]['name'],
+                    'text': self.body_text.get('1.0', 'end-1c')}
+        self.app.settings['snippets'] = snips
+        self.app.settings.save()
+        self.fill(i)
+
+    def delete(self):
+        i = self.index()
+        if i is None or not messagebox.askyesno(APP_NAME, f"Delete the snippet '{self.snippets[i]['name']}'?",
+                                                parent=self):
+            return
+        self.app.settings['snippets'] = [s for k, s in enumerate(self.snippets) if k != i]
+        self.app.settings.save()
+        self.fill(i)
+
+    def insert(self):
+        i = self.index()
+        if i is not None:
+            self.app.insert_snippet_by_index(i)
+
+
 class FindDialog(Dialog):
     def __init__(self, app, replace=False):
         super().__init__(app, 'Find and replace' if replace else 'Find')
@@ -2046,7 +2346,7 @@ class App:
         self._bind_keys()
         self.apply_theme()
 
-        opened = False
+        opened = self.recover_backups()
         for p in files:
             opened |= self.open_path(p)
         if not opened:
@@ -2057,6 +2357,45 @@ class App:
             self.new_file()
         self.root.protocol('WM_DELETE_WINDOW', self.quit)
         self.root.after(120, self._restore_sashes)
+        self.root.after(BACKUP_SECONDS * 1000, self._backup_tick)
+
+    # -- auto-backup ------------------------------------------------------
+    def _backup_tick(self):
+        for ed in self.editors:
+            ed.write_backup()
+        self.root.after(BACKUP_SECONDS * 1000, self._backup_tick)
+
+    def recover_backups(self):
+        """After a crash: offer to reopen unsaved scripts from the backup folder."""
+        found = []
+        for f in sorted(glob.glob(os.path.join(BACKUP_DIR, '*.json'))):
+            try:
+                with open(f, encoding='utf-8') as fh:
+                    found.append((f, json.load(fh)))
+            except (OSError, ValueError):
+                continue
+        if not found:
+            return False
+        names = '\n'.join(f"  {d.get('path') or d.get('title', 'Untitled')}   (backed up {d.get('saved_at', '?')})"
+                          for _, d in found[:10])
+        more = f'\n  ... and {len(found) - 10} more' if len(found) > 10 else ''
+        answer = messagebox.askyesno(
+            APP_NAME, f"Testscript-Pad didn't close properly last time. These scripts had unsaved changes:\n\n"
+                      f'{names}{more}\n\nOpen the unsaved versions? (No deletes the backups.)', parent=self.root)
+        opened = False
+        for f, d in found:
+            if answer:
+                ed = self.add_editor(d.get('path'), d.get('text', ''), d.get('encoding', 'utf-8'),
+                                     d.get('newline', '\r\n'))
+                ed._modified = True             # not saved yet: the file on disk is still the old version
+                self.update_tab_title(ed)
+                ed.write_backup()               # keep it safe under the new tab's backup name
+                opened = True
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return opened
 
     def _make_icon(self):
         img = tk.PhotoImage(width=16, height=16)
@@ -2218,7 +2557,7 @@ class App:
         self.status.pack(side='bottom', fill='x')
         self.status_parts = {}
         # right-hand parts are packed first so a long help text can't squeeze them out
-        for key in ('eol', 'pos', 'hid', 'map', 'game', 'counts'):
+        for key in ('eol', 'pos', 'hid', 'time', 'map', 'game', 'counts'):
             lbl = ttk.Label(self.status, text='', style='Status.TLabel')
             lbl.pack(side='right')
             self.status_parts[key] = lbl
@@ -2227,6 +2566,7 @@ class App:
         self.status_parts['counts'].bind('<Button-1>', lambda e: self.next_problem(1))
         Tooltip(self.status_parts['counts'], 'Errors / warnings / notes - click to go to the next one', self)
         Tooltip(self.status_parts['hid'], 'Next free hammerid (Ctrl+I inserts it)', self)
+        Tooltip(self.status_parts['time'], 'Total Test_Wait time - how long the script takes to run', self)
         self.status_parts['map'].bind('<Button-1>', lambda e: self.map_window())
         self.status_parts['game'].configure(text='game not linked')
         self.status_parts['game'].bind('<Button-1>', lambda e: self.link_game())
@@ -2285,6 +2625,8 @@ class App:
         self.outline.pack(side='left', fill='both', expand=True, padx=(4, 0))
         osb.pack(side='left', fill='y')
         self.outline.bind('<<TreeviewSelect>>', self._outline_jump)
+        TreeTooltip(self.outline, self)
+        self.outline.bind('<Button-3>', self._outline_menu)
         self._outline_lines = {}
         self._outline_open = {'sections': True, 'aliases': True, 'names': False, 'ids': False}
 
@@ -2314,6 +2656,7 @@ class App:
         self.problems.pack(side='left', fill='both', expand=True, padx=(4, 0))
         psb.pack(side='left', fill='y')
         self.problems.bind('<<TreeviewSelect>>', self._problem_jump)
+        TreeTooltip(self.problems, self, column='msg')
         self._problem_rows = {}
 
         self.vpane.add(self.nb, weight=5)
@@ -2472,6 +2815,9 @@ class App:
         m.add_cascade(label='Edit', menu=em)
 
         im = tk.Menu(m, tearoff=False)
+        self.snippet_menu = tk.Menu(im, tearoff=False, postcommand=lambda: self._fill_snippet_menu(self.snippet_menu))
+        im.add_cascade(label='My snippets', menu=self.snippet_menu)
+        im.add_separator()
         im.add_command(label='Entity...', accelerator='Ctrl+E', command=self.insert_entity)
         im.add_command(label='Output...', accelerator='Ctrl+Shift+O', command=self.insert_output)
         im.add_command(label='Alias...', command=self.insert_alias)
@@ -2517,6 +2863,7 @@ class App:
         tl.add_command(label='Number +10 / -10', accelerator='Ctrl+Alt+Shift+Up/Down',
                        command=lambda: self._ed('nudge', 10))
         tl.add_separator()
+        tl.add_command(label='Who uses this name?', accelerator='Shift+F12', command=self.find_uses)
         tl.add_command(label='Rename name everywhere...', accelerator='F2', command=self.rename_symbol)
         tl.add_command(label='Split commands onto separate lines', command=self.split_lines)
         tl.add_command(label='Join selected lines into one', command=self.join_lines)
@@ -2538,6 +2885,12 @@ class App:
         vm.add_checkbutton(label='Outline panel', variable=self.outline_var, command=lambda: self.toggle_panel('show_outline'))
         vm.add_checkbutton(label='Problems panel', variable=self.problems_var, command=lambda: self.toggle_panel('show_problems'))
         vm.add_checkbutton(label='Word wrap', variable=self.wrap_var, command=self.toggle_wrap)
+        self.timing_var = tk.BooleanVar(value=self.settings['show_timing'])
+        vm.add_checkbutton(label='Timing column (Test_Wait time)', variable=self.timing_var,
+                           command=self.toggle_timing)
+        self.hover_var = tk.BooleanVar(value=self.settings['hover_help'])
+        vm.add_checkbutton(label='Hover help', variable=self.hover_var,
+                           command=lambda: self.settings.__setitem__('hover_help', self.hover_var.get()))
         vm.add_checkbutton(label='Autocomplete while typing', variable=self.ac_var, command=self.toggle_ac)
         vm.add_separator()
         vm.add_command(label='Zoom in', accelerator='Ctrl++', command=lambda: self.zoom(1))
@@ -2564,6 +2917,7 @@ class App:
             '<Control-i>': self.insert_hammerid, '<F5>': self.check_now,
             '<F8>': lambda: self.next_problem(1), '<Shift-F8>': lambda: self.next_problem(-1),
             '<F2>': self.rename_symbol, '<F1>': lambda: ReferenceWindow(self),
+            '<Shift-F12>': self.find_uses, '<Control-j>': self.snippet_popup,
             '<F9>': self.run_in_game, '<Control-F9>': self.copy_run_command,
             '<Control-p>': self.coord_dialog, '<Control-m>': self.map_window,
             '<Control-grave>': self.console_window, '<Control-P>': self.position_from_game,
@@ -2593,13 +2947,19 @@ class App:
         t.bind('<Button-3>', lambda e: self._context_menu(e, ed))
 
     def _context_menu(self, event, ed):
+        if not ed.text.tag_ranges('sel'):
+            ed.text.mark_set('insert', f'@{event.x},{event.y}')     # right-click acts on the clicked word
         m = tk.Menu(self.root, tearoff=False)
         for label, ev in (('Cut', '<<Cut>>'), ('Copy', '<<Copy>>'), ('Paste', '<<Paste>>')):
             m.add_command(label=label, command=lambda ev=ev: ed.text.event_generate(ev))
         m.add_separator()
         m.add_command(label='Toggle comment', command=ed.toggle_comment)
+        word = ed.word_under_cursor()
+        if word:
+            m.add_command(label=f"Who uses '{word}'?", command=lambda: self.find_uses(word))
         m.add_command(label='Rename name everywhere...', command=self.rename_symbol)
         m.add_command(label='Insert entity...', command=self.insert_entity)
+        m.add_command(label='Save selection as snippet...', command=self.save_snippet)
         m.add_command(label='Insert output...', command=self.insert_output)
         m.tk_popup(event.x_root, event.y_root)
 
@@ -2789,6 +3149,7 @@ class App:
             if r and not self.save(ed):
                 return False
         ed.completer.hide()
+        ed.remove_backup()
         self.nb.forget(ed)
         self.editors.remove(ed)
         ed.destroy()
@@ -2809,6 +3170,8 @@ class App:
         self.settings['geometry'] = self.root.geometry()
         self._remember_sashes()
         self.settings.save()
+        for ed in self.editors:
+            ed.remove_backup()          # a normal exit: nothing to recover next time
         self.root.destroy()
 
     # -- edit helpers -----------------------------------------------------
@@ -3170,6 +3533,57 @@ class App:
             d = CoordDialog(self, ed)
             d.from_game()
 
+    # -- snippets ---------------------------------------------------------
+    def _fill_snippet_menu(self, menu):
+        menu.delete(0, 'end')
+        for i, snip in enumerate(self.settings['snippets']):
+            menu.add_command(label=snip['name'], command=lambda i=i: self.insert_snippet_by_index(i))
+        if not self.settings['snippets']:
+            menu.add_command(label='(none saved yet)', state='disabled')
+        menu.add_separator()
+        menu.add_command(label='Save selection as snippet...', command=self.save_snippet)
+        menu.add_command(label='Manage snippets...', command=lambda: SnippetsWindow(self))
+
+    def snippet_popup(self):
+        """Ctrl+J: the snippet list at the cursor."""
+        ed = self.current()
+        if not ed:
+            return
+        m = tk.Menu(self.root, tearoff=False)
+        self._fill_snippet_menu(m)
+        bbox = ed.text.bbox('insert') or (0, 0, 0, 0)
+        m.tk_popup(ed.text.winfo_rootx() + bbox[0], ed.text.winfo_rooty() + bbox[1] + bbox[3])
+
+    def save_snippet(self):
+        ed = self.current()
+        if not ed:
+            return
+        first, last = ed.selected_lines()
+        text = ed.text.get(f'{first}.0', f'{last}.end')
+        if not text.strip():
+            messagebox.showinfo(APP_NAME, 'Select the lines to save first.', parent=self.root)
+            return
+        first_word = text.strip().split()[0][:30]
+        name = simpledialog.askstring(APP_NAME, f'Name for this snippet ({last - first + 1} line(s)):\n\n'
+                                                'Tip: write {hid} where a hammerid goes - it becomes the next '
+                                                'free one when you insert the snippet.',
+                                      initialvalue=first_word, parent=self.root)
+        if not name or not name.strip():
+            return
+        snips = [s for s in self.settings['snippets'] if s['name'] != name.strip()]
+        snips.append({'name': name.strip(), 'text': text})
+        self.settings['snippets'] = sorted(snips, key=lambda s: s['name'].lower())
+        self.settings.save()
+        self.set_status_message(f"Saved snippet '{name.strip()}' - Insert > My snippets or Ctrl+J")
+
+    def insert_snippet_by_index(self, i):
+        ed = self.current()
+        if not ed or not 0 <= i < len(self.settings['snippets']):
+            return
+        ed._run_analysis()
+        text = tslang.fill_snippet(self.settings['snippets'][i]['text'], ed.analysis.next_hammerid())
+        self.insert_block(ed, text)
+
     def insert_hammerid(self):
         ed = self.current()
         if ed:
@@ -3203,6 +3617,18 @@ class App:
             d = prev[-1] if prev else ds[-1]
         ed.goto_line(d.line, d.col, d.end)
         self.set_status_message(f'{d.severity.upper()}: {d.message}')
+
+    def find_uses(self, name=None):
+        ed = self.current()
+        if not ed:
+            return
+        name = name or ed.word_under_cursor()
+        if not name:
+            name = simpledialog.askstring(APP_NAME, 'Find the uses of which name?', parent=self.root)
+            if not name:
+                return
+        ed._run_analysis()
+        UsesWindow(self, ed, name.strip())
 
     def rename_symbol(self):
         ed = self.current()
@@ -3282,6 +3708,11 @@ class App:
         for ed in self.editors:
             ed.set_wrap(self.settings['wrap'])
 
+    def toggle_timing(self):
+        self.settings['show_timing'] = self.timing_var.get()
+        for ed in self.editors:
+            ed.schedule_gutter()
+
     def toggle_ac(self):
         self.settings['autocomplete'] = self.ac_var.get()
 
@@ -3304,6 +3735,8 @@ class App:
             'Ctrl+D       Duplicate line',
             'Alt+Up/Down  Move line',
             'F2           Rename a name everywhere',
+            'Shift+F12    Who uses this name? (every line that names / fires at it)',
+            'Ctrl+J       My snippets (save your own under Insert > My snippets)',
             'F5           Check script',
             'F8 / Shift+F8  Next / previous problem',
             'Ctrl+F / Ctrl+H  Find / replace, F3 find next',
@@ -3367,6 +3800,15 @@ class App:
             for k, v in sorted(a.hammerids.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)])
         o.yview_moveto(top)
 
+    def _outline_menu(self, event):
+        row = self.outline.identify_row(event.y)
+        if not row or self.outline.parent(row) not in ('names', 'aliases'):
+            return
+        name = self.outline.item(row, 'text').split('  =  ')[0].strip()
+        m = tk.Menu(self.root, tearoff=False)
+        m.add_command(label=f"Who uses '{name}'?", command=lambda: self.find_uses(name))
+        m.tk_popup(event.x_root, event.y_root)
+
     def _outline_jump(self, _e):
         sel = self.outline.selection()
         ed = self.current()
@@ -3388,6 +3830,8 @@ class App:
         sp = self.status_parts
         sp['counts'].configure(text=f"✖ {c['error']}   ▲ {c['warning']}   ● {c['info']}")
         sp['hid'].configure(text=f'hammerid {ed.analysis.next_hammerid()}')
+        total = ed.analysis.total_time
+        sp['time'].configure(text=f'runs {tslang.format_time(total)}' if total else '')
         sp['map'].configure(text=f'map {ed.analysis.map.name}' if ed.analysis.map else 'no map')
         sp['pos'].configure(text=f'Ln {ln}, Col {int(col) + 1}')
         enc = 'UTF-8' if ed.encoding.startswith('utf') else 'ANSI'

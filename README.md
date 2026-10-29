@@ -155,6 +155,33 @@ The editor reads the entities out of the script's map (`tf\maps\<map>.bsp`). It 
 
 To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `Ctrl+Alt+Down` (±1), or add `Shift` for ±10.
 
+### Timing
+
+The gutter shows **when each line runs**: the total `Test_Wait` time before it (`0.5s`, `12.5s`, `1:05.2`). The time appears wherever it changes, and in grey on the cursor line. Waits inside aliases count too. The status bar shows how long the whole script takes (*runs 11.1s*). Turn the column off under **View → Timing column**.
+
+### Hover help
+
+Rest the mouse on a word to see what it is: what a command, input or output does, what an alias runs, where a name is made and how many lines use it, which map entity a hammerid is, and any problem on that spot. Outline and problem rows that are cut off show their full text on hover. Turn it off under **View → Hover help**.
+
+### Who uses this name
+
+**Shift+F12**, the right-click menu, or a right-click on a name in the outline lists every line that uses a name:
+
+- **names it:** `addoutput"targetname cph`, `ent_setname`, `classname`
+- **targets it:** `ent_fire cph ...`
+- **output targets it:** `"OnTrigger cph,setowner,2"`
+- **targets it (wildcard):** `ent_fire cou* ...` also hits `countred`
+
+It also mentions when the map already has an entity with that name. Click a row to jump to it.
+
+### My snippets
+
+Select some lines and use **Save selection as snippet...**, from **Insert → My snippets** or the right-click menu. Insert them again from that menu, or press **`Ctrl+J`** for the list at the cursor. Write `{hid}` where a hammerid goes (`{hid+1}`, `{hid+2}` ... for more) and it becomes the next free hammerid when inserted, so one entity block can be reused without clashes. **Manage snippets...** edits, renames and deletes them.
+
+### Auto-backup
+
+Every 30 seconds, tabs with unsaved changes are copied to `%APPDATA%\Testscript-Pad\backups`. Saving or closing a tab removes its backup, and so does closing the editor normally. If Testscript-Pad or Windows crashes, the next start lists the scripts with unsaved changes and offers to reopen them. They open as unsaved, and the files on disk are left as they were until you save.
+
 ### Tools
 
 - Rename a name everywhere (`F2`)
@@ -199,6 +226,8 @@ To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `
 | `Ctrl+D` | Duplicate line |
 | `Alt+Up` / `Alt+Down` | Move line |
 | `F2` | Rename a name everywhere |
+| `Shift+F12` | Who uses this name? |
+| `Ctrl+J` | My snippets |
 | `F5` | Check script |
 | `F8` / `Shift+F8` | Next / previous problem |
 | `Ctrl+F` / `Ctrl+H` / `F3` | Find / replace / find next |

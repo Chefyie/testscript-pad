@@ -1033,6 +1033,8 @@ class Analysis:
         self.hammerids = {}          # id -> {'line', 'cls', 'name'}
         self.models = set()
         self.sections = []           # (line, title)
+        self.line_times = {}         # line -> seconds after the script starts when that line runs
+        self.total_time = 0.0
         self.end_line = None
         self.diagnostics = []
         self.map = None              # mapdata.MapInfo the script was checked against
@@ -1083,6 +1085,7 @@ class _Checker:
         self.lines = text.split('\n')
         self.live = set()        # classnames spawned by the script and not renamed yet
         self.pending_ids = set() # hammerids set since the last Test_Wait
+        self.clock = 0.0         # Test_Wait seconds so far
         self.tn_defs = {}        # targetname -> first line (script spawned entities)
 
     def run(self):
@@ -1099,6 +1102,7 @@ class _Checker:
             if is_end_marker(line):
                 a.end_line = ln
                 continue
+            a.line_times[ln] = self.clock
             stmts, comment = lex_line(line)
             if comment is not None and not stmts:
                 title = line[comment:].lstrip('/').strip()
@@ -1117,6 +1121,7 @@ class _Checker:
                 a.diag(ln, 0, len(self.lines[ln - 1]), 'info', f"Alias '{name}' is never used")
         if self.map is not None:
             self.check_targets()
+        a.total_time = self.clock
         a.diagnostics.sort(key=lambda d: (d.line, d.col))
         return a
 
@@ -1196,6 +1201,8 @@ class _Checker:
         if cmd == 'test_wait':
             if not args or not NUM_RE.fullmatch(args[0].text):
                 a.diag(ln, c0, c1, 'error', 'Test_Wait needs a number of seconds, e.g. Test_Wait .1')
+            else:
+                self.clock += max(0.0, float(args[0].text))
             self.pending_ids.clear()
             return
 
@@ -1415,6 +1422,15 @@ def parse_position(text):
     return pos, ang
 
 
+def format_time(seconds):
+    """Script time for the gutter: 0.4s, 12.5s, 1:05.2"""
+    if seconds < 60:
+        return format_number(round(seconds, 2), 2) + 's'
+    m, s = divmod(round(seconds, 1), 60)
+    text = format_number(s, 1)
+    return f'{int(m)}:{"0" if s < 10 else ""}{text}'
+
+
 def format_number(value, decimals=None):
     """Short number text: decimals=None keeps up to 3 places, trailing zeros dropped."""
     if decimals == 0:
@@ -1502,3 +1518,50 @@ def launch_options(options):
     if not re.search(r'(^|\s)-game\s', options):
         options = '-game tf ' + options
     return options
+
+
+# --------------------------------------------------------------------------
+# Who uses a name
+# --------------------------------------------------------------------------
+
+USE_KINDS = {
+    'targetdef': 'names it', 'aliasdef': 'defines the alias', 'alias': 'runs the alias',
+    'hammerid': 'hammerid', 'target': 'targets it', 'entity': 'targets it', 'special': 'targets it',
+}
+
+
+def find_uses(text, name, aliases=frozenset()):
+    """Every place a name appears: [(line, col, end, kind)], kind from USE_KINDS or 'mentions it'.
+
+    Wildcard targets that match the name (ent_fire bgate* ...) count as 'targets it (wildcard)'.
+    """
+    if not name:
+        return []
+    word = re.compile(r'(?<![\w!*@`^.\-])' + re.escape(name) + r'(?![\w])', re.I)
+    low = name.lower()
+    out = []
+    for ln, line in enumerate(text.split('\n'), 1):
+        spans = None
+        for m in word.finditer(line):
+            if spans is None:
+                spans = highlight_line(line, aliases)
+            tags = [t for s, e, t in spans if s <= m.start() < e and t not in ('string', 'sep')]
+            kind = USE_KINDS.get(tags[-1] if tags else '', 'mentions it')
+            if kind == 'targets it' and line[m.end():].lstrip().startswith(','):
+                kind = 'output targets it'      # outputs are "target,input,..."
+            out.append((ln, m.start(), m.end(), kind))
+        if '*' in line:
+            spans = spans if spans is not None else highlight_line(line, aliases)
+            for s, e, t in spans:
+                target = line[s:e]
+                if t in ('target', 'entity') and '*' in target:
+                    pat = re.escape(target.lower()).replace(r'\*', '.*') + '$'
+                    if re.match(pat, low) and target.lower() != low:
+                        out.append((ln, s, e, 'targets it (wildcard)'))
+    out.sort()
+    return out
+
+
+def fill_snippet(text, next_hammerid):
+    """Replace {hid}, {hid+1}, ... in a saved snippet with free hammerids."""
+    return re.sub(r'\{hid(?:\+(\d+))?\}', lambda m: str(next_hammerid + int(m.group(1) or 0)), text)
