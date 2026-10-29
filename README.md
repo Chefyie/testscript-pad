@@ -4,6 +4,8 @@ An editor for **Orange Box / TF2 testscripts** that understands the testscript l
 
 Testscripts are text files of console commands (`ent_fire`, `give`, `ent_keyvalue`, `Test_Wait`, ...) that the game runs from top to bottom. People use them to build whole gamemodes: KOTH on 2Fort, Payload on Dustbowl, CTF on Hydro, Zombie Fortress and so on. Testscript-Pad adds syntax highlighting, autocomplete, a script checker and builders for the long entity blocks these scripts are made of.
 
+![Testscript-Pad editing a 2Fort gamemode script: syntax colors, outline, Test_Wait timing in the gutter, hover help and the problems panel](docs/screenshots/editor.png)
+
 ## Getting started
 
 ### The .exe (no Python needed)
@@ -61,6 +63,8 @@ Suggestions appear as you type (or press `Ctrl+Space`) and depend on where the c
 
 The status bar explains the word under the cursor: what a command, input or output does, what an alias expands to, or which entity a hammerid belongs to.
 
+![Autocomplete suggesting the map's door entities after ent_fire](docs/screenshots/autocomplete.png)
+
 ### Script checker
 
 The **Problems** panel updates as you type. `F5` runs the check and `F8` jumps to the next problem. It flags:
@@ -81,6 +85,8 @@ The **Problems** panel updates as you type. `F5` runs the check and `F8` jumps t
   - step by step: `give x;` then `ent_fire x addoutput"classname name;` ... `Test_Wait .1;`
 - **Output... (`Ctrl+Shift+O`)**, **Alias...**, **Test_Wait** (`Ctrl+T`), **next free hammerid** (`Ctrl+I`)
 - Snippets for point_clientcommand/point_servercommand, respawn times and goal text, restart round, and `///`
+
+![The entity builder writing a game_text block step by step](docs/screenshots/entity-builder.png)
 
 ### Run in game
 
@@ -134,6 +140,8 @@ In the editor:
 
 The editor reads the entities out of the script's map (`tf\maps\<map>.bsp`). It picks the map from the script's folder, the same way **Run in game** does (`Gamemodes/2Fort/...` → `ctf_2fort`). With that it knows every entity the map already has:
 
+![The map entities window searching ctf_2fort for door_blue](docs/screenshots/map-entities.png)
+
 - **Autocomplete** suggests map names (`flag_blue`, `door_blue1_2_up`, ...) as targets, and their hammerids after `ent_keyvalue`.
 - **The status bar** explains map names and hammerids. Put the cursor on `418237` in a Hydro script and it says *tc_hydro entity – trigger_multiple at 1664 2088 24*.
 - **The checker** flags targets that neither the script nor the map has (usually a typo or a missing entity), and `ent_keyvalue` hammerids the map doesn't contain. Wildcards, `kill` on missing entities, and entities the game creates while running (`spotlight_end`, `tf_weapon_*`, ...) are left alone.
@@ -155,6 +163,8 @@ The editor reads the entities out of the script's map (`tf\maps\<map>.bsp`). It 
 
 To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `Ctrl+Alt+Down` (±1), or add `Shift` for ±10.
 
+![The coordinates dialog turning getpos output into ent_fire origin and angles lines](docs/screenshots/coordinates.png)
+
 ### Timing
 
 The gutter shows **when each line runs**: the total `Test_Wait` time before it (`0.5s`, `12.5s`, `1:05.2`). The time appears wherever it changes, and in grey on the cursor line. Waits inside aliases count too. The status bar shows how long the whole script takes (*runs 11.1s*). Turn the column off under **View → Timing column**.
@@ -173,6 +183,8 @@ Rest the mouse on a word to see what it is: what a command, input or output does
 - **targets it (wildcard):** `ent_fire cou* ...` also hits `countred`
 
 It also mentions when the map already has an entity with that name. Click a row to jump to it.
+
+![Every line that names or targets roundtimer](docs/screenshots/who-uses.png)
 
 ### My snippets
 
