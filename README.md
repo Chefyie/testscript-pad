@@ -76,6 +76,40 @@ The **Problems** panel updates as you type. `F5` runs the check and `F8` jumps t
 - **Output... (`Ctrl+Shift+O`)**, **Alias...**, **Test_Wait** (`Ctrl+T`), **next free hammerid** (`Ctrl+I`)
 - Snippets for point_clientcommand/point_servercommand, respawn times and goal text, restart round, and `///`
 
+### Run in game
+
+Press **`F9`** (or **▶ Run** on the toolbar). The editor saves the script and then:
+
+- **If TF2 isn't running,** it starts `hl2.exe` with your launch options, loads the map that matches the script's folder, waits a few seconds, and runs the script. For example, `Gamemodes/2Fort/KOTH.txt` loads `ctf_2fort`, `Dustbowl` loads `cp_dustbowl` and `Hydro` loads `tc_hydro`. It does this through a small launcher testscript, `tf\testscripts\testscript_pad_launch.txt`, which is rewritten on every run and is safe to delete.
+- **If TF2 is already running,** it sends `test_startscript <script>` to that game with `-hijack` instead of opening a second copy.
+
+Either way, the `test_startscript Gamemodes/2Fort/KOTH.txt` command is also copied to the clipboard. `Ctrl+F9` only copies it, without launching.
+
+The script must be saved somewhere under `tf\testscripts\`. The game folder (the one with `hl2.exe`) is found from where the script is saved. You can set it yourself under **Tools → Game settings...**, along with:
+
+- **Launch options:** `-testscript` is added for you. The default is `-game tf 440 -sw -w 1920 -h 1080 -port 27016 -novid -dev -console -insecure -toconsole -nohltv -nomaster`.
+- **Map to load:** auto (from the folder name), a fixed map, or none (run the script straight at startup)
+- **Map when the folder has no match:** used for scripts in folders like `Any`. The default is `ctf_2fort`.
+- **Seconds to wait before the script starts:** default 20. The countdown starts when the map starts loading, and connecting to your own server takes around 13 seconds on 2Fort. Starting a script before you're in the game crashes TF2, so raise this if the game crashes on launch.
+- **Run in the already-running game:** on by default
+- **Clipboard command:** `{path}` is the path from the testscripts folder, `{name}` is just the file name
+
+### Coordinates
+
+**Coordinates... (`Ctrl+P`)** turns positions into script text:
+
+1. Type `getpos` in the TF2 console and copy the `setpos ...;setang ...` line it prints.
+2. Open the dialog. It picks up the copied line from the clipboard automatically. You can also paste it, type the numbers, or click **From line** to read the `origin`/`angles` already on the cursor line.
+3. Add an offset if you want (for example `-64` on Z), choose how to round, and pick a format:
+   - `origin"x y z"`, for `ent_keyvalue` and `ent_create`
+   - `ent_fire <name> addoutput"origin x y z;`
+   - `name,addoutput,origin x y z`, for use inside an output
+   - `setpos x y z;setang p y r;`
+   - plain `x y z`
+4. Click **Insert** or **Copy**.
+
+To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `Ctrl+Alt+Down` (±1), or add `Shift` for ±10.
+
 ### Tools
 
 - Rename a name everywhere (`F2`)
@@ -108,6 +142,10 @@ The **Problems** panel updates as you type. `F5` runs the check and `F8` jumps t
 | `Ctrl+Shift+O` | Insert output |
 | `Ctrl+T` | Insert `Test_Wait .1` |
 | `Ctrl+I` | Insert next free hammerid |
+| `Ctrl+P` | Coordinates (getpos → origin / setpos) |
+| `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Number under the cursor +1 / −1 (add `Shift` for ±10) |
+| `F9` | Run in game (save, then launch TF2 or send to the running game) |
+| `Ctrl+F9` | Copy the `test_startscript` command only |
 | `Ctrl+/` | Toggle comment |
 | `Ctrl+D` | Duplicate line |
 | `Alt+Up` / `Alt+Down` | Move line |

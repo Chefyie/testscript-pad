@@ -6,6 +6,7 @@ Run:  pythonw testscript_pad.py [files...]
 import json
 import os
 import re
+import subprocess
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -109,6 +110,17 @@ mp_restartround 1;
 # Settings
 # ==========================================================================
 
+def begin_undo(text):
+    """Start a group of edits that Ctrl+Z undoes in one step."""
+    text.edit_separator()
+    text.configure(autoseparators=False)
+
+
+def end_undo(text):
+    text.edit_separator()
+    text.configure(autoseparators=True)
+
+
 def set_dark_titlebar(win, dark):
     """Windows 10/11: ask DWM for a dark (or light) title bar."""
     if sys.platform != 'win32':
@@ -165,6 +177,9 @@ class Settings:
         'last_dir': DEFAULT_DIR, 'open_files': [], 'geometry': '1280x800',
         'show_outline': True, 'show_problems': True, 'wrap': False, 'autocomplete': True,
         'outline_width': 230, 'problems_height': 150, 'show_toolbar': True,
+        'run_template': 'test_startscript {path}',
+        'game_dir': '', 'launch_options': tslang.DEFAULT_LAUNCH_OPTIONS, 'launch_map': '',
+        'fallback_map': 'ctf_2fort', 'launch_wait_s': 20, 'reuse_game': True,
     }
 
     def __init__(self):
@@ -254,10 +269,10 @@ class Completer:
             return
         word = self.items[sel[0]]
         txt = self.ed.text
-        txt.edit_separator()
+        begin_undo(txt)
         txt.delete(self.start, 'insert')
         txt.insert(self.start, word)
-        txt.edit_separator()
+        end_undo(txt)
         self.hide()
         txt.focus_set()
 
@@ -697,10 +712,10 @@ class Editor(ttk.Frame):
 
     def replace_lines(self, first, last, new_lines):
         t = self.text
-        t.edit_separator()
+        begin_undo(t)
         t.delete(f'{first}.0', f'{last}.end')
         t.insert(f'{first}.0', '\n'.join(new_lines))
-        t.edit_separator()
+        end_undo(t)
         t.tag_remove('sel', '1.0', 'end')
         t.tag_add('sel', f'{first}.0', f'{first + len(new_lines) - 1}.end')
 
@@ -725,9 +740,9 @@ class Editor(ttk.Frame):
     def duplicate_line(self):
         first, last = self.selected_lines()
         block = self.text.get(f'{first}.0', f'{last}.end')
-        self.text.edit_separator()
+        begin_undo(self.text)
         self.text.insert(f'{last}.end', '\n' + block)
-        self.text.edit_separator()
+        end_undo(self.text)
         return 'break'
 
     def move_lines(self, delta):
@@ -764,6 +779,23 @@ class Editor(ttk.Frame):
         t.focus_set()
         t.tag_add('flash', f'{ln}.0', f'{ln}.end')
         self.after(500, lambda: t.tag_remove('flash', '1.0', 'end'))
+
+    def nudge(self, delta):
+        """Ctrl+Alt+Up/Down: add to the number under the cursor."""
+        ln, col = map(int, self.text.index('insert').split('.'))
+        line = self.text.get(f'{ln}.0', f'{ln}.end')
+        res = tslang.nudge_number(line, col, delta)
+        if res is None:
+            return 'break'
+        new_line, start, end = res
+        old_end = end - (len(new_line) - len(line))
+        t = self.text
+        begin_undo(t)
+        t.delete(f'{ln}.{start}', f'{ln}.{old_end}')
+        t.insert(f'{ln}.{start}', new_line[start:end])
+        end_undo(t)
+        t.mark_set('insert', f'{ln}.{min(col, end)}')
+        return 'break'
 
     def word_under_cursor(self):
         ln, col = map(int, self.text.index('insert').split('.'))
@@ -1073,6 +1105,284 @@ class OutputDialog(Dialog):
         self.destroy()
 
 
+class CoordDialog(Dialog):
+    """Turns getpos output (or numbers) into origin/angles/setpos text."""
+
+    FORMATS = [
+        ('kv', 'origin"x y z"   (ent_keyvalue / ent_create pair)'),
+        ('ent_fire', 'ent_fire <name> addoutput"origin x y z;'),
+        ('output', 'addoutput,origin x y z   (inside an output)'),
+        ('setpos', 'setpos x y z;setang p y r;'),
+        ('plain', 'x y z'),
+    ]
+
+    def __init__(self, app, editor):
+        super().__init__(app, 'Coordinates')
+        self.ed = editor
+        b = self.body
+        names = sorted(editor.analysis.names, key=str.lower)
+        self.paste = tk.StringVar()
+        self.pos = [tk.StringVar(value='0') for _ in range(3)]
+        self.ang = [tk.StringVar(value='0') for _ in range(3)]
+        self.offset = [tk.StringVar(value='0') for _ in range(3)]
+        self.with_angles = tk.BooleanVar(value=False)
+        self.decimals = tk.StringVar(value='whole numbers')
+        self.fmt = tk.StringVar(value='kv')
+        self.name = tk.StringVar(value=editor.word_under_cursor() if editor.word_under_cursor() in names else
+                                 (names[0] if names else 'my_entity'))
+
+        ttk.Label(b, text='Paste getpos output (type getpos in the console, copy the setpos... line)').grid(
+            row=0, column=0, columnspan=7, sticky='w')
+        pe = ttk.Entry(b, textvariable=self.paste, width=70)
+        pe.grid(row=1, column=0, columnspan=5, sticky='ew', pady=(2, 8))
+        ttk.Button(b, text='Paste', command=self.paste_clipboard).grid(row=1, column=5, padx=(6, 0), pady=(2, 8))
+        ttk.Button(b, text='From line', command=self.from_line).grid(row=1, column=6, padx=(6, 0), pady=(2, 8))
+        Tooltip(b.grid_slaves(row=1, column=6)[0], 'Read the origin/angles on the cursor line', app)
+
+        for r, (label, vars_, heads) in enumerate((
+                ('Position', self.pos, ('X', 'Y', 'Z')),
+                ('Offset', self.offset, ('+X', '+Y', '+Z')),
+                ('Angles', self.ang, ('Pitch', 'Yaw', 'Roll'))), 2):
+            ttk.Label(b, text=label).grid(row=r, column=0, sticky='w', pady=2)
+            f = ttk.Frame(b)
+            f.grid(row=r, column=1, columnspan=6, sticky='w', pady=2)
+            for var, head in zip(vars_, heads):
+                ttk.Label(f, text=head, width=6, anchor='e').pack(side='left')
+                ttk.Entry(f, textvariable=var, width=13).pack(side='left', padx=(4, 10))
+        of = ttk.Frame(b)
+        of.grid(row=5, column=1, columnspan=6, sticky='w', pady=(6, 0))
+        ttk.Checkbutton(of, text='Include angles', variable=self.with_angles,
+                        command=self.refresh).pack(side='left', padx=(6, 20))
+        ttk.Label(of, text='Round to').pack(side='left')
+        ttk.Combobox(of, textvariable=self.decimals, state='readonly', width=14,
+                     values=['whole numbers', '1 decimal', '2 decimals', 'as is']).pack(side='left', padx=6)
+
+        ttk.Label(b, text='Write as').grid(row=6, column=0, sticky='nw', pady=(10, 0))
+        ff = ttk.Frame(b)
+        ff.grid(row=6, column=1, columnspan=6, sticky='w', pady=(10, 0))
+        for val, txt in self.FORMATS:
+            ttk.Radiobutton(ff, text=txt, value=val, variable=self.fmt, command=self.refresh).pack(anchor='w')
+        ttk.Label(b, text='Entity name').grid(row=7, column=0, sticky='w', pady=(6, 0))
+        ttk.Combobox(b, textvariable=self.name, values=names, width=30).grid(
+            row=7, column=1, columnspan=4, sticky='w', pady=(6, 0))
+
+        self.preview = tk.Text(b, height=3, width=70, font=app.font, wrap='none', **app.text_opts())
+        self.preview.grid(row=8, column=0, columnspan=7, sticky='nsew', pady=(10, 0))
+        self.preview.configure(state='disabled')
+        bf = ttk.Frame(b)
+        bf.grid(row=9, column=0, columnspan=7, sticky='e', pady=(10, 0))
+        ttk.Button(bf, text='Insert', command=self.insert).pack(side='right')
+        ttk.Button(bf, text='Copy', command=self.copy).pack(side='right', padx=6)
+        ttk.Button(bf, text='Close', command=self.destroy).pack(side='right')
+        b.columnconfigure(4, weight=1)
+        b.rowconfigure(8, weight=1)
+
+        self.paste.trace_add('write', lambda *_: self.parse(self.paste.get()))
+        for v in self.pos + self.ang + self.offset + [self.decimals, self.name]:
+            v.trace_add('write', lambda *_: self.refresh())
+        # start from getpos output on the clipboard, or the cursor line
+        try:
+            clip = self.clipboard_get()
+        except tk.TclError:
+            clip = ''
+        if re.search(r'setpos', clip, re.I):
+            self.paste.set(clip.strip())
+        else:
+            self.from_line(quiet=True)
+        self.refresh()
+        self.center()
+        pe.focus_set()
+
+    def paste_clipboard(self):
+        try:
+            self.paste.set(self.clipboard_get().strip())
+        except tk.TclError:
+            pass
+
+    def from_line(self, quiet=False):
+        line = self.ed.text.get('insert linestart', 'insert lineend')
+        pos, ang = tslang.parse_position(line) if re.search(r'origin|angles|setpos|setang', line, re.I) else (None, None)
+        if pos is None and ang is None:
+            if not quiet:
+                self.app.set_status_message('No origin/angles on the cursor line')
+            return
+        self.parse(line)
+
+    def parse(self, text):
+        pos, ang = tslang.parse_position(text)
+        if pos:
+            for var, v in zip(self.pos, pos):
+                var.set(tslang.format_number(v))
+        if ang:
+            for var, v in zip(self.ang, ang):
+                var.set(tslang.format_number(v))
+            self.with_angles.set(True)
+        self.refresh()
+
+    def _vals(self, vars_, offsets=None):
+        places = {'whole numbers': 0, '1 decimal': 1, '2 decimals': 2}.get(self.decimals.get())
+        out = []
+        for i, var in enumerate(vars_):
+            try:
+                v = float(var.get() or 0)
+                if offsets:
+                    v += float(offsets[i].get() or 0)
+            except ValueError:
+                return None
+            out.append(tslang.format_number(v, places))
+        return ' '.join(out)
+
+    def build(self):
+        pos = self._vals(self.pos, self.offset)
+        ang = self._vals(self.ang)
+        if pos is None or ang is None:
+            return '(numbers only, please)'
+        angles = self.with_angles.get()
+        name = self.name.get().strip() or 'my_entity'
+        fmt = self.fmt.get()
+        if fmt == 'kv':
+            return f'origin"{pos}"' + (f' angles"{ang}"' if angles else '')
+        if fmt == 'ent_fire':
+            code = f'ent_fire {name} addoutput"origin {pos};'
+            return code + (f'\nent_fire {name} addoutput"angles {ang};' if angles else '')
+        if fmt == 'output':
+            return f'{name},addoutput,origin {pos}' + (f'\n{name},addoutput,angles {ang}' if angles else '')
+        if fmt == 'setpos':
+            return f'setpos {pos};' + (f'setang {ang};' if angles else '')
+        return pos + (f'\n{ang}' if angles else '')
+
+    def refresh(self):
+        p = self.preview
+        p.configure(state='normal')
+        p.delete('1.0', 'end')
+        p.insert('1.0', self.build())
+        p.configure(state='disabled')
+
+    def copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.build())
+        self.app.set_status_message('Copied coordinates')
+
+    def insert(self):
+        code = self.build()
+        if self.fmt.get() in ('ent_fire', 'setpos'):
+            self.app.insert_block(self.ed, code)
+        else:
+            self.ed.text.insert('insert', code.replace('\n', ' '))
+        self.destroy()
+
+
+class GameSettingsDialog(Dialog):
+    """Where the game is and how Run in game starts it."""
+
+    AUTO_MAP = '(auto - from the script folder)'
+    NO_MAP = '(none - run the script at startup)'
+
+    def __init__(self, app, script_path=None):
+        super().__init__(app, 'Game settings')
+        b = self.body
+        st = app.settings
+        self.detected = tslang.game_dir_from_script(script_path) if script_path else None
+        self.game_dir = tk.StringVar(value=st['game_dir'])
+        self.options = tk.StringVar(value=st['launch_options'])
+        self.map = tk.StringVar(value={'': self.AUTO_MAP, '-': self.NO_MAP}.get(st['launch_map'], st['launch_map']))
+        self.fallback = tk.StringVar(value=st['fallback_map'])
+        self.wait = tk.StringVar(value=tslang.format_number(float(st['launch_wait_s'])))
+        self.reuse = tk.BooleanVar(value=st['reuse_game'])
+        self.template = tk.StringVar(value=st['run_template'])
+
+        r = 0
+        ttk.Label(b, text='Game folder (the one with hl2.exe)').grid(row=r, column=0, sticky='w')
+        r += 1
+        gf = ttk.Frame(b)
+        gf.grid(row=r, column=0, columnspan=3, sticky='ew')
+        ttk.Entry(gf, textvariable=self.game_dir, width=60).pack(side='left', fill='x', expand=True)
+        ttk.Button(gf, text='Browse...', command=self.browse).pack(side='left', padx=(6, 0))
+        r += 1
+        self.dir_status = ttk.Label(b, text='')
+        self.dir_status.grid(row=r, column=0, columnspan=3, sticky='w', pady=(2, 10))
+        r += 1
+        ttk.Label(b, text='Launch options  (-testscript is added for you)').grid(row=r, column=0, sticky='w')
+        r += 1
+        of = ttk.Frame(b)
+        of.grid(row=r, column=0, columnspan=3, sticky='ew', pady=(0, 10))
+        ttk.Entry(of, textvariable=self.options, width=60).pack(side='left', fill='x', expand=True)
+        ttk.Button(of, text='Reset', command=lambda: self.options.set(tslang.DEFAULT_LAUNCH_OPTIONS)).pack(
+            side='left', padx=(6, 0))
+        r += 1
+        ttk.Label(b, text='Map to load').grid(row=r, column=0, sticky='w')
+        self.map_box = ttk.Combobox(b, textvariable=self.map, width=36)
+        self.map_box.grid(row=r, column=1, sticky='w', padx=6, pady=2)
+        r += 1
+        ttk.Label(b, text='Map when the folder has no match').grid(row=r, column=0, sticky='w')
+        self.fallback_box = ttk.Combobox(b, textvariable=self.fallback, width=36)
+        self.fallback_box.grid(row=r, column=1, sticky='w', padx=6, pady=2)
+        r += 1
+        ttk.Label(b, text='Seconds to wait before the script starts').grid(row=r, column=0, sticky='w')
+        ttk.Spinbox(b, from_=0, to=120, increment=1, textvariable=self.wait, width=6).grid(
+            row=r, column=1, sticky='w', padx=6, pady=2)
+        r += 1
+        ttk.Checkbutton(b, text='If the game is already running, run the script in it (-hijack)',
+                        variable=self.reuse).grid(row=r, column=0, columnspan=3, sticky='w', pady=(8, 2))
+        r += 1
+        ttk.Label(b, text='Console command copied to the clipboard  ({path} = path from testscripts, {name} = file name)').grid(
+            row=r, column=0, columnspan=3, sticky='w', pady=(10, 0))
+        r += 1
+        ttk.Entry(b, textvariable=self.template, width=60).grid(row=r, column=0, columnspan=3, sticky='ew')
+        r += 1
+        bf = ttk.Frame(b)
+        bf.grid(row=r, column=0, columnspan=3, sticky='e', pady=(14, 0))
+        ttk.Button(bf, text='Save', command=self.save).pack(side='right')
+        ttk.Button(bf, text='Cancel', command=self.destroy).pack(side='right', padx=6)
+        b.columnconfigure(2, weight=1)
+        self.game_dir.trace_add('write', lambda *_: self.check_dir())
+        self.check_dir()
+        self.center()
+
+    def effective_dir(self):
+        return self.game_dir.get().strip() or self.detected or ''
+
+    def check_dir(self):
+        d = self.effective_dir()
+        ok = bool(d) and os.path.isfile(os.path.join(d, 'hl2.exe'))
+        where = 'detected from the script: ' + d if not self.game_dir.get().strip() and d else d
+        if not d:
+            msg = 'Not set - pick the folder that contains hl2.exe'
+        elif ok:
+            msg = f'✔ hl2.exe found  ({where})'
+        else:
+            msg = f'✖ no hl2.exe in {d}'
+        self.dir_status.configure(text=msg, foreground=self.app.theme['ok' if ok else 'error'])
+        maps = self.app.installed_maps(d)
+        self.map_box.configure(values=[self.AUTO_MAP, self.NO_MAP] + maps)
+        self.fallback_box.configure(values=maps)
+
+    def browse(self):
+        d = filedialog.askdirectory(parent=self, title='Folder that contains hl2.exe',
+                                    initialdir=self.effective_dir() or os.path.expanduser('~'))
+        if d:
+            self.game_dir.set(os.path.normpath(d))
+
+    def save(self):
+        try:
+            wait = max(0.0, float(self.wait.get()))
+        except ValueError:
+            messagebox.showwarning(APP_NAME, 'The wait must be a number of seconds.', parent=self)
+            return
+        st = self.app.settings
+        st['game_dir'] = self.game_dir.get().strip()
+        st['launch_options'] = self.options.get().strip() or tslang.DEFAULT_LAUNCH_OPTIONS
+        m = self.map.get().strip()
+        st['launch_map'] = {self.AUTO_MAP: '', self.NO_MAP: '-'}.get(m, m)
+        st['fallback_map'] = self.fallback.get().strip()
+        st['launch_wait_s'] = wait
+        st['reuse_game'] = self.reuse.get()
+        st['run_template'] = self.template.get().strip() or 'test_startscript {path}'
+        st.save()
+        self.app.set_status_message('Game settings saved')
+        self.destroy()
+
+
 class FindDialog(Dialog):
     def __init__(self, app, replace=False):
         super().__init__(app, 'Find and replace' if replace else 'Find')
@@ -1172,9 +1482,10 @@ class FindDialog(Dialog):
             if m:
                 rep = m.expand(self.repl.get()) if self.regex.get() else self.repl.get()
                 start = t.index('sel.first')
-                t.edit_separator()
+                begin_undo(t)
                 t.delete('sel.first', 'sel.last')
                 t.insert(start, rep)
+                end_undo(t)
                 t.mark_set('insert', f'{start}+{len(rep)}c')
         self.search(1)
 
@@ -1473,6 +1784,9 @@ class App:
             ('+ Wait', lambda: self.insert_snippet('Test_Wait .1;'), 'Insert Test_Wait .1 (Ctrl+T)'),
             ('+ Alias', self.insert_alias, 'Insert an alias'),
             None,
+            ('+ Coords', self.coord_dialog, 'Turn getpos output into origin / setpos text (Ctrl+P)'),
+            None,
+            ('▶ Run', self.run_in_game, 'Save and run in TF2 (F9) - set the game folder under Tools > Game settings'),
             ('Check', self.check_now, 'Check the script for problems (F5)'),
             ('Find', lambda: self.show_find(False), 'Find (Ctrl+F)'),
             ('Rename', self.rename_symbol, 'Rename a name everywhere (F2)'),
@@ -1722,6 +2036,16 @@ class App:
         tl.add_command(label='Next problem', accelerator='F8', command=lambda: self.next_problem(1))
         tl.add_command(label='Previous problem', accelerator='Shift+F8', command=lambda: self.next_problem(-1))
         tl.add_separator()
+        tl.add_command(label='Run in game', accelerator='F9', command=self.run_in_game)
+        tl.add_command(label='Copy run command', accelerator='Ctrl+F9', command=self.copy_run_command)
+        tl.add_command(label='Game settings...', command=self.game_settings)
+        tl.add_separator()
+        tl.add_command(label='Coordinates...', accelerator='Ctrl+P', command=self.coord_dialog)
+        tl.add_command(label='Number +1', accelerator='Ctrl+Alt+Up', command=lambda: self._ed('nudge', 1))
+        tl.add_command(label='Number -1', accelerator='Ctrl+Alt+Down', command=lambda: self._ed('nudge', -1))
+        tl.add_command(label='Number +10 / -10', accelerator='Ctrl+Alt+Shift+Up/Down',
+                       command=lambda: self._ed('nudge', 10))
+        tl.add_separator()
         tl.add_command(label='Rename name everywhere...', accelerator='F2', command=self.rename_symbol)
         tl.add_command(label='Split commands onto separate lines', command=self.split_lines)
         tl.add_command(label='Join selected lines into one', command=self.join_lines)
@@ -1769,6 +2093,8 @@ class App:
             '<Control-i>': self.insert_hammerid, '<F5>': self.check_now,
             '<F8>': lambda: self.next_problem(1), '<Shift-F8>': lambda: self.next_problem(-1),
             '<F2>': self.rename_symbol, '<F1>': lambda: ReferenceWindow(self),
+            '<F9>': self.run_in_game, '<Control-F9>': self.copy_run_command,
+            '<Control-p>': self.coord_dialog,
             '<Control-equal>': lambda: self.zoom(1), '<Control-plus>': lambda: self.zoom(1),
             '<Control-minus>': lambda: self.zoom(-1), '<Control-0>': lambda: self.zoom(0),
             '<Control-Tab>': lambda: self.cycle_tab(1), '<Control-Shift-Tab>': lambda: self.cycle_tab(-1),
@@ -1783,6 +2109,10 @@ class App:
         t.bind('<Control-d>', lambda e: ed.duplicate_line())
         t.bind('<Alt-Up>', lambda e: ed.move_lines(-1))
         t.bind('<Alt-Down>', lambda e: ed.move_lines(1))
+        t.bind('<Control-Alt-Up>', lambda e: ed.nudge(1))
+        t.bind('<Control-Alt-Down>', lambda e: ed.nudge(-1))
+        t.bind('<Control-Alt-Shift-Up>', lambda e: ed.nudge(10))
+        t.bind('<Control-Alt-Shift-Down>', lambda e: ed.nudge(-10))
         # widget-level copies of the app shortcuts so Text's own bindings
         # (Ctrl+O open line, Ctrl+T transpose, Ctrl+H backspace...) don't run first
         for seq, fn in self.shortcuts.items():
@@ -2053,10 +2383,10 @@ class App:
         t = ed.text
         top = t.yview()[0]
         pos = t.index('insert')
-        t.edit_separator()
+        begin_undo(t)
         t.delete('1.0', 'end')
         t.insert('1.0', new)
-        t.edit_separator()
+        end_undo(t)
         t.mark_set('insert', pos)
         t.yview_moveto(top)
 
@@ -2064,14 +2394,14 @@ class App:
         """Insert code as whole lines after the cursor's line (or on it if empty)."""
         t = ed.text
         line = t.get('insert linestart', 'insert lineend')
-        t.edit_separator()
+        begin_undo(t)
         if line.strip():
             t.mark_set('insert', 'insert lineend')
             t.insert('insert', '\n' + code)
         else:
             t.delete('insert linestart', 'insert lineend')
             t.insert('insert', code)
-        t.edit_separator()
+        end_undo(t)
         t.see('insert')
         t.focus_set()
 
@@ -2106,6 +2436,109 @@ class App:
         if body is None:
             return
         self.insert_block(ed, f'alias {name}"{body.strip().rstrip(";")};')
+
+    def coord_dialog(self):
+        ed = self.current()
+        if ed:
+            ed._run_analysis()
+            CoordDialog(self, ed)
+
+    def _script_to_run(self):
+        """Save the current script and return (editor, path from testscripts), or None."""
+        ed = self.current()
+        if not ed:
+            return None
+        if (ed.modified or not ed.path) and not self.save(ed):
+            return None
+        rel = tslang.testscript_relpath(ed.path)
+        if rel is None:
+            messagebox.showwarning(
+                APP_NAME, f'{ed.path}\n\nis not inside a testscripts folder, so the game can\'t find it.\n'
+                          'Save it under ...\\tf\\testscripts\\ and try again.', parent=self.root)
+            return None
+        return ed, rel
+
+    def copy_run_command(self):
+        got = self._script_to_run()
+        if not got:
+            return
+        cmd = tslang.run_command(got[0].path, self.settings['run_template'])
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cmd)
+        self.set_status_message(f'Copied  {cmd}  - paste it into the TF2 console')
+
+    def game_dir_for(self, path):
+        return self.settings['game_dir'].strip() or tslang.game_dir_from_script(path) or ''
+
+    @staticmethod
+    def installed_maps(game_dir):
+        folder = os.path.join(game_dir, 'tf', 'maps') if game_dir else ''
+        try:
+            return sorted(f[:-4] for f in os.listdir(folder) if f.lower().endswith('.bsp'))
+        except OSError:
+            return []
+
+    @staticmethod
+    def game_running():
+        if sys.platform != 'win32':
+            return False
+        try:
+            out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq hl2.exe', '/NH'], capture_output=True,
+                                 text=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return 'hl2.exe' in out.lower()
+
+    def run_in_game(self):
+        """Save the script and start it in TF2 (launching the game when it isn't running)."""
+        got = self._script_to_run()
+        if not got:
+            return
+        ed, rel = got
+        st = self.settings
+        cmd = tslang.run_command(ed.path, st['run_template'])
+        self.root.clipboard_clear()
+        self.root.clipboard_append(cmd)
+        game_dir = self.game_dir_for(ed.path)
+        hl2 = os.path.join(game_dir, 'hl2.exe') if game_dir else ''
+        if not hl2 or not os.path.isfile(hl2):
+            self.set_status_message(f'Copied  {cmd}  - set the game folder to launch TF2 from here')
+            GameSettingsDialog(self, ed.path)
+            return
+
+        if st['reuse_game'] and self.game_running():
+            args = f'"{hl2}" -hijack -game tf +{cmd}'
+            what = 'Sent to the running game'
+        else:
+            map_name = None
+            if st['launch_map'] == '':
+                map_name = tslang.guess_map(rel, self.installed_maps(game_dir)) or st['fallback_map'] or None
+            elif st['launch_map'] != '-':
+                map_name = st['launch_map']
+            if map_name:
+                launcher = os.path.join(game_dir, 'tf', 'testscripts', tslang.LAUNCHER_SCRIPT)
+                try:
+                    with open(launcher, 'w', encoding='utf-8', newline='\r\n') as f:
+                        f.write(tslang.launcher_script(rel, map_name, st['launch_wait_s']))
+                except OSError as e:
+                    messagebox.showerror(APP_NAME, f'Could not write {launcher}\n\n{e}', parent=self.root)
+                    return
+                script_arg = tslang.LAUNCHER_SCRIPT
+                what = f'Launching TF2 on {map_name}, then {rel}'
+            else:
+                script_arg = rel
+                what = f'Launching TF2 with {rel}'
+            args = f'"{hl2}" {tslang.launch_options(st["launch_options"])} -testscript "{script_arg}"'
+        try:
+            subprocess.Popen(args, cwd=game_dir)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f'Could not start the game\n\n{args}\n\n{e}', parent=self.root)
+            return
+        self.set_status_message(f'{what}   (also copied: {cmd})')
+
+    def game_settings(self):
+        ed = self.current()
+        GameSettingsDialog(self, ed.path if ed else None)
 
     def insert_hammerid(self):
         ed = self.current()
@@ -2229,6 +2662,10 @@ class App:
             'Ctrl+Shift+O Insert output',
             'Ctrl+T       Insert Test_Wait .1',
             'Ctrl+I       Insert next free hammerid',
+            'Ctrl+P       Coordinates (getpos -> origin / setpos)',
+            'Ctrl+Alt+Up/Down  Number under cursor +1 / -1 (add Shift for 10)',
+            'F9           Run in game (save, then launch TF2 or send to the running game)',
+            'Ctrl+F9      Copy the test_startscript command only',
             'Ctrl+/       Toggle comment',
             'Ctrl+D       Duplicate line',
             'Alt+Up/Down  Move line',

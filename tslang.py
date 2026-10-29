@@ -1296,3 +1296,138 @@ def expand_aliases_line(line, aliases):
                 body = aliases[name][1].strip().rstrip(';').strip()
                 line = line[:w.start] + body + line[w.end:]
     return line
+
+
+# --------------------------------------------------------------------------
+# Running scripts and coordinates
+# --------------------------------------------------------------------------
+
+def testscript_relpath(path):
+    """Path of a script relative to its testscripts folder, with '/' separators.
+
+    D:\\Games\\game\\tf\\testscripts\\Gamemodes\\2Fort\\KOTH.txt -> Gamemodes/2Fort/KOTH.txt
+    Returns None when the file isn't inside a folder called testscripts.
+    """
+    parts = re.split(r'[\\/]+', path)
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i].lower() == 'testscripts':
+            return '/'.join(parts[i + 1:])
+    return None
+
+
+def run_command(path, template='test_startscript {path}'):
+    """The console command that starts the script, or None if it isn't under testscripts."""
+    rel = testscript_relpath(path)
+    if rel is None:
+        return None
+    name = re.split(r'[\\/]+', path)[-1]
+    return template.replace('{path}', rel).replace('{name}', name)
+
+
+NUM = r'[-+]?(?:\d+\.?\d*|\.\d+)'
+
+
+def parse_position(text):
+    """Pull (x, y, z) and (pitch, yaw, roll) out of getpos output or plain numbers.
+
+    Understands 'setpos 1 2 3;setang 4 5 6', 'origin "1 2 3"', or just '1 2 3 [4 5 6]'.
+    Either part is None when it isn't there.
+    """
+    pos = ang = None
+    m = re.search(rf'setpos(?:_exact)?\s+({NUM})\s+({NUM})\s+({NUM})', text, re.I)
+    if m:
+        pos = tuple(float(v) for v in m.groups())
+    m = re.search(rf'setang(?:_exact)?\s+({NUM})\s+({NUM})(?:\s+({NUM}))?', text, re.I)
+    if m:
+        ang = tuple(float(v) if v is not None else 0.0 for v in m.groups())
+    if pos is None:
+        m = re.search(rf'origin\W*({NUM})\s+({NUM})\s+({NUM})', text, re.I)
+        if m:
+            pos = tuple(float(v) for v in m.groups())
+    if ang is None:
+        m = re.search(rf'angles\W*({NUM})(?:\s+({NUM}))?(?:\s+({NUM}))?', text, re.I)
+        if m:
+            ang = tuple(float(v) if v is not None else 0.0 for v in m.groups())
+    if pos is None and ang is None:
+        nums = [float(v) for v in re.findall(NUM, text)]
+        if len(nums) >= 3:
+            pos = tuple(nums[:3])
+        if len(nums) >= 6:
+            ang = tuple(nums[3:6])
+    return pos, ang
+
+
+def format_number(value, decimals=None):
+    """Short number text: decimals=None keeps up to 3 places, trailing zeros dropped."""
+    if decimals == 0:
+        text = str(int(round(value)))
+    else:
+        text = f'{value:.{3 if decimals is None else decimals}f}'.rstrip('0').rstrip('.')
+    return '0' if text in ('-0', '') else text
+
+
+def nudge_number(line, col, delta):
+    """Add delta to the number at col. Returns (new_line, start, end) or None."""
+    for m in re.finditer(rf'(?<![\w.]){NUM}(?![\w])', line):
+        if m.start() <= col <= m.end():
+            old = m.group()
+            places = len(old.split('.')[1]) if '.' in old else 0
+            new = format_number(float(old) + delta, places)
+            if places and '.' not in new:
+                new += '.' + '0' * places
+            return line[:m.start()] + new + line[m.end():], m.start(), m.start() + len(new)
+    return None
+
+
+# --------------------------------------------------------------------------
+# Launching the game
+# --------------------------------------------------------------------------
+
+DEFAULT_LAUNCH_OPTIONS = ('-game tf 440 -sw -w 1920 -h 1080 -port 27016 -novid -dev -console '
+                          '-insecure -toconsole -nohltv -nomaster')
+LAUNCHER_SCRIPT = 'testscript_pad_launch.txt'
+
+
+def game_dir_from_script(path):
+    """D:\\Games\\game\\tf\\testscripts\\x.txt -> D:\\Games\\game (the folder holding hl2.exe)."""
+    parts = re.split(r'[\\/]+', path)
+    for i in range(len(parts) - 2, 0, -1):
+        if parts[i].lower() == 'testscripts' and parts[i - 1].lower() == 'tf':
+            return '\\'.join(parts[:i - 1]) or None
+    return None
+
+
+def guess_map(relpath, maps):
+    """Pick the map a script is for from its folder names (Gamemodes/2Fort/KOTH.txt -> ctf_2fort).
+
+    maps: installed map names without .bsp. Returns None when no folder matches.
+    """
+    by_lower = {m.lower(): m for m in maps}
+    folders = [f.lower() for f in relpath.split('/')[:-1]]
+    for f in reversed(folders):
+        if f in by_lower:
+            return by_lower[f]
+    for f in reversed(folders):
+        hits = sorted(m for m in maps if re.search(rf'(^|_){re.escape(f)}($|_)', m.lower()))
+        if hits:
+            return hits[0]
+    return None
+
+
+def launcher_script(relpath, map_name, wait):
+    """Testscript that loads a map, waits, then starts the real script."""
+    return (f'// Written by Testscript-Pad to start {relpath} - safe to delete\n'
+            f'sv_cheats 1;\n'
+            f'map {map_name};\n'
+            f'Test_Wait {format_number(float(wait))};\n'
+            f'sv_cheats 1;\n'
+            f'test_startscript {relpath};\n'
+            f'///\n')
+
+
+def launch_options(options):
+    """Launch options with -game tf added when missing."""
+    options = options.strip()
+    if not re.search(r'(^|\s)-game\s', options):
+        options = '-game tf ' + options
+    return options
