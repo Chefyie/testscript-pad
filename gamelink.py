@@ -7,7 +7,9 @@ binds the port to the machine's network address (which isn't always
 ports for hl2.exe.
 """
 
+import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -109,3 +111,45 @@ class GameLink:
         if self.conn is not None:
             self.conn.close()
         self.conn = None
+
+
+# --------------------------------------------------------------------------
+# Testscript-Pad plugin (plugin/testscript_pad_plugin.cpp)
+# --------------------------------------------------------------------------
+
+PLUGIN_FILES = ('testscript_pad.dll', 'testscript_pad.vdf')
+ENT_FIELDS = ('classname', 'targetname', 'hammerid', 'origin', 'angles', 'model', 'parentname')
+
+
+def parse_entities(text, tag='TSP_ENT'):
+    """Entities from tsp_ents / tsp_find / tsp_pick output, as dicts of ENT_FIELDS."""
+    out = []
+    for line in text.splitlines():
+        parts = line.rstrip('\r').split('\t')
+        if parts[0] == tag and len(parts) > 1 and parts[1] != 'none':
+            out.append(dict(zip(ENT_FIELDS, parts[1:] + [''] * len(ENT_FIELDS))))
+    return out
+
+
+def parse_pick(text):
+    """(entity dict or None, 'x y z' aim point or None) from tsp_pick output."""
+    ents = parse_entities(text, 'TSP_PICK')
+    hit = next((l.split('\t')[1].strip() for l in text.splitlines() if l.startswith('TSP_HIT\t')), None)
+    return (ents[0] if ents else None), hit
+
+
+def plugin_error(text):
+    """The plugin's TSP_ERROR message, '' when there is none."""
+    return next((l.split('\t', 1)[1].strip() for l in text.splitlines() if l.startswith('TSP_ERROR\t')), '')
+
+
+def plugin_installed(game_dir):
+    return bool(game_dir) and os.path.isfile(os.path.join(game_dir, 'tf', 'addons', PLUGIN_FILES[0]))
+
+
+def install_plugin(source_dir, game_dir):
+    """Copy the plugin DLL and .vdf into <game>/tf/addons. Raises OSError (e.g. TF2 is running)."""
+    addons = os.path.join(game_dir, 'tf', 'addons')
+    os.makedirs(addons, exist_ok=True)
+    for name in PLUGIN_FILES:
+        shutil.copyfile(os.path.join(source_dir, name), os.path.join(addons, name))

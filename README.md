@@ -25,7 +25,7 @@ pythonw testscript_pad.py path/to/script.txt
 
 ### Building the .exe yourself
 
-Double-click **`build.bat`**. The first time, it creates a `.venv-build` folder and installs [PyInstaller](https://pyinstaller.org) into it, without touching your normal Python. The result is `dist\Testscript-Pad.exe`. The icon comes from `assets\icon.ico`, which `tools\make_icon.py` draws.
+Double-click **`build.bat`**. The first time, it creates a `.venv-build` folder and installs [PyInstaller](https://pyinstaller.org) into it, without touching your normal Python. The result is `dist\Testscript-Pad.exe`, which includes the game plugin if `plugin\build_plugin.bat` has been run. The icon comes from `assets\icon.ico`, which `tools\make_icon.py` draws.
 
 The open dialog starts in `D:\Games\game\tf\testscripts` if that folder exists. Open tabs are restored the next time you start the editor.
 
@@ -86,7 +86,7 @@ The **Problems** panel updates as you type. `F5` runs the check and `F8` jumps t
 
 Press **`F9`** (or **▶ Run** on the toolbar). The editor saves the script and then:
 
-- **If TF2 isn't running,** it starts `hl2.exe` with your launch options, loads the map that matches the script's folder, waits a few seconds, and runs the script. For example, `Gamemodes/2Fort/KOTH.txt` loads `ctf_2fort`, `Dustbowl` loads `cp_dustbowl` and `Hydro` loads `tc_hydro`. It does this through a small launcher testscript, `tf\testscripts\testscript_pad_launch.txt`, which is rewritten on every run and is safe to delete.
+- **If TF2 isn't running,** it starts `hl2.exe` with your launch options, loads the map that matches the script's folder, skips *waiting for players*, closes the welcome and team menus, joins a team as **Scout** (you can change the team and class in Game settings), waits a few seconds, and runs the script. For example, `Gamemodes/2Fort/KOTH.txt` loads `ctf_2fort`, `Dustbowl` loads `cp_dustbowl` and `Hydro` loads `tc_hydro`. It does this through a small launcher testscript, `tf\testscripts\testscript_pad_launch.txt`, which is rewritten on every run and is safe to delete.
 - **If TF2 is already running,** it sends `test_startscript <script>` to that game with `-hijack` instead of opening a second copy.
 
 Either way, the `test_startscript Gamemodes/2Fort/KOTH.txt` command is also copied to the clipboard. `Ctrl+F9` only copies it, without launching.
@@ -110,6 +110,25 @@ When **Run in game** starts TF2, it adds `-usercon -condebug +rcon_password <pas
 - **The status bar** shows *game linked* / *game not linked*. Click it to connect to a game that's already running.
 
 Turn it off under **Tools → Game settings...** if you don't want RCON on.
+
+### Game plugin
+
+`plugin/` holds a small C++ server plugin for TF2 (`testscript_pad.dll`). It adds console commands that the editor uses over the game link:
+
+| Command | What it prints |
+|---|---|
+| `tsp_pick [pitch yaw]` | the entity under your crosshair, plus the exact point you're aiming at |
+| `tsp_ents [text]` | every live entity, including ones your script created |
+| `tsp_find <hammerid\|name>` | one entity's class, name, hammerid, origin and angles |
+
+In the editor:
+
+- **Pick (`Ctrl+Shift+E`)** asks the game what you're looking at. Things that aren't solid, like the intel, triggers and logic entities, are found too. You can insert its name, hammerid, origin, angles, or the **aim point**, which is handy for placing props exactly where you're looking.
+- **Game entities** lists everything that exists in the game right now, searchable. Unlike **Map entities**, it also shows entities your script made while running.
+
+**Install it** with **Tools → Game settings... → Testscript-Pad plugin → Install / update**, with TF2 closed. That copies the DLL and `testscript_pad.vdf` into `tf\addons`, and TF2 loads it at startup (it needs `-insecure`, which the default launch options have). The release `.exe` carries the plugin inside it.
+
+**Building it yourself** needs Visual Studio with *Desktop development with C++*. Run `plugin\build_plugin.bat`. The first time, it downloads the Orange Box SDK headers ([alliedmodders/hl2sdk](https://github.com/alliedmodders/hl2sdk), `orangebox` branch) into `.sdk`. Then run `build.bat` again so the `.exe` includes the new DLL.
 
 ### Map entities
 
@@ -172,6 +191,7 @@ To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `
 | `Ctrl+M` | Map entities |
 | `` Ctrl+` `` | Game console |
 | `Ctrl+Shift+P` | Position from game |
+| `Ctrl+Shift+E` | Pick what you're looking at (plugin) |
 | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Number under the cursor +1 / −1 (add `Shift` for ±10) |
 | `F9` | Run in game (save, then launch TF2 or send to the running game) |
 | `Ctrl+F9` | Copy the `test_startscript` command only |
@@ -194,6 +214,7 @@ To fine-tune a number in place, put the cursor on it and press `Ctrl+Alt+Up` / `
 | `tslang.py` | the testscript language: vocabulary, highlighting, autocomplete context, checker |
 | `mapdata.py` | reads the entity list out of `.bsp` map files |
 | `gamelink.py`, `rcon.py` | the connection to a running TF2 (RCON) |
+| `plugin/` | the C++ game plugin and `build_plugin.bat` |
 | `Testscript-Pad.bat` | Windows launcher |
 | `build.bat`, `tools/make_icon.py`, `assets/icon.ico` | building the `.exe` |
 

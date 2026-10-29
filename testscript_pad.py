@@ -185,6 +185,7 @@ class Settings:
         'game_dir': '', 'launch_options': tslang.DEFAULT_LAUNCH_OPTIONS, 'launch_map': '',
         'fallback_map': 'ctf_2fort', 'launch_wait_s': 20, 'reuse_game': True,
         'script_maps': {}, 'game_link': True, 'rcon_password': '',
+        'skip_waiting': True, 'auto_team': 'auto', 'auto_class': 'scout',
     }
 
     def __init__(self):
@@ -1306,6 +1307,7 @@ class GameSettingsDialog(Dialog):
 
     AUTO_MAP = '(auto - from the script folder)'
     NO_MAP = '(none - run the script at startup)'
+    NO_JOIN = "(don't)"
 
     def __init__(self, app, script_path=None):
         super().__init__(app, 'Game settings')
@@ -1351,8 +1353,29 @@ class GameSettingsDialog(Dialog):
         ttk.Spinbox(b, from_=0, to=120, increment=1, textvariable=self.wait, width=6).grid(
             row=r, column=1, sticky='w', padx=6, pady=2)
         r += 1
+        ttk.Label(b, text='After the map loads').grid(row=r, column=0, sticky='w', pady=(8, 0))
+        jf = ttk.Frame(b)
+        jf.grid(row=r, column=1, columnspan=2, sticky='w', pady=(8, 0))
+        self.skip_waiting = tk.BooleanVar(value=st['skip_waiting'])
+        ttk.Checkbutton(jf, text='skip waiting for players', variable=self.skip_waiting).pack(side='left')
+        ttk.Label(jf, text='   join team').pack(side='left')
+        self.team = tk.StringVar(value=st['auto_team'] or self.NO_JOIN)
+        ttk.Combobox(jf, textvariable=self.team, state='readonly', width=10,
+                     values=[self.NO_JOIN] + tslang.TEAMS).pack(side='left', padx=4)
+        ttk.Label(jf, text='as').pack(side='left')
+        self.pclass = tk.StringVar(value=st['auto_class'] or self.NO_JOIN)
+        ttk.Combobox(jf, textvariable=self.pclass, state='readonly', width=13,
+                     values=[self.NO_JOIN] + tslang.CLASSES).pack(side='left', padx=4)
+        r += 1
         ttk.Checkbutton(b, text='If the game is already running, run the script in it',
                         variable=self.reuse).grid(row=r, column=0, columnspan=3, sticky='w', pady=(8, 2))
+        r += 1
+        ttk.Label(b, text='Testscript-Pad plugin').grid(row=r, column=0, sticky='w', pady=(8, 2))
+        pf = ttk.Frame(b)
+        pf.grid(row=r, column=1, columnspan=2, sticky='w', pady=(8, 2))
+        self.plugin_status = ttk.Label(pf, text='')
+        self.plugin_status.pack(side='left')
+        ttk.Button(pf, text='Install / update', command=self.install_plugin).pack(side='left', padx=8)
         r += 1
         self.link = tk.BooleanVar(value=st['game_link'])
         ttk.Checkbutton(b, text='Game link: start TF2 with RCON on (-usercon, console log, a private password) '
@@ -1370,6 +1393,8 @@ class GameSettingsDialog(Dialog):
         ttk.Button(bf, text='Cancel', command=self.destroy).pack(side='right', padx=6)
         b.columnconfigure(2, weight=1)
         self.game_dir.trace_add('write', lambda *_: self.check_dir())
+        self.game_dir.trace_add('write', lambda *_: self.check_plugin())
+        self.check_plugin()
         self.check_dir()
         self.center()
 
@@ -1391,6 +1416,24 @@ class GameSettingsDialog(Dialog):
         self.map_box.configure(values=[self.AUTO_MAP, self.NO_MAP] + maps)
         self.fallback_box.configure(values=maps)
 
+    def check_plugin(self):
+        d = self.effective_dir()
+        if self.app.plugin_source() is None:
+            text, color = 'not bundled with this copy (build it with plugin\\build_plugin.bat)', 'muted'
+        elif gamelink.plugin_installed(d):
+            text, color = '✔ installed in tf\\addons (gives Pick and Game entities)', 'ok'
+        else:
+            text, color = 'not installed - needed for Pick and Game entities', 'warning'
+        self.plugin_status.configure(text=text, foreground=self.app.theme[color])
+
+    def install_plugin(self):
+        d = self.effective_dir()
+        if not d or not os.path.isfile(os.path.join(d, 'hl2.exe')):
+            messagebox.showwarning(APP_NAME, 'Set the game folder first.', parent=self)
+            return
+        if self.app.install_plugin(d, parent=self):
+            self.check_plugin()
+
     def browse(self):
         d = filedialog.askdirectory(parent=self, title='Folder that contains hl2.exe',
                                     initialdir=self.effective_dir() or os.path.expanduser('~'))
@@ -1411,6 +1454,9 @@ class GameSettingsDialog(Dialog):
         st['fallback_map'] = self.fallback.get().strip()
         st['launch_wait_s'] = wait
         st['reuse_game'] = self.reuse.get()
+        st['skip_waiting'] = self.skip_waiting.get()
+        st['auto_team'] = '' if self.team.get() == self.NO_JOIN else self.team.get()
+        st['auto_class'] = '' if self.pclass.get() == self.NO_JOIN else self.pclass.get()
         st['game_link'] = self.link.get()
         st['run_template'] = self.template.get().strip() or 'test_startscript {path}'
         st.save()
@@ -1639,6 +1685,152 @@ class ConsoleWindow(Dialog):
         # output of RCON commands only comes back here, it isn't written to console.log
         if reply:
             self.write(reply if reply.endswith('\n') else reply + '\n', 'reply')
+
+
+def short_numbers(text):
+    """'489.005005 -3348.510010 -131.106003' -> '489.005 -3348.51 -131.106'."""
+    try:
+        return ' '.join(tslang.format_number(float(v)) for v in text.split())
+    except ValueError:
+        return text
+
+
+class GameEntitiesWindow(Dialog):
+    """Entities in the running game (needs the Testscript-Pad plugin): pick what you look at, browse the rest."""
+
+    def __init__(self, app, editor, pick_now=False):
+        super().__init__(app, 'Game entities')
+        self.geometry('1000x620')
+        self.ed = editor
+        self.current = None
+        self.aim = None
+        b = self.body
+        top = ttk.Frame(b)
+        top.pack(fill='x')
+        ttk.Button(top, text='Pick what I\'m looking at', command=self.pick).pack(side='left')
+        ttk.Button(top, text='Refresh list', command=self.refresh).pack(side='left', padx=6)
+        ttk.Label(top, text='Search').pack(side='left', padx=(12, 0))
+        self.q = tk.StringVar()
+        ttk.Entry(top, textvariable=self.q).pack(side='left', fill='x', expand=True, padx=6)
+        self.named_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text='Named only', variable=self.named_only, command=self.fill).pack(side='left')
+
+        self.detail = ttk.Label(b, text='', justify='left', wraplength=960)
+        self.detail.pack(fill='x', pady=(10, 4))
+        bf = ttk.Frame(b)
+        bf.pack(fill='x', pady=(0, 6))
+        self.buttons = []
+        for label, what in (('Insert name', 'name'), ('Insert hammerid', 'hid'), ('Insert origin', 'origin'),
+                            ('Insert angles', 'angles'), ('Insert aim point', 'aim')):
+            btn = ttk.Button(bf, text=label, command=lambda w=what: self.insert(w))
+            btn.pack(side='left', padx=(0, 6))
+            self.buttons.append((what, btn))
+        Tooltip(self.buttons[-1][1], 'The exact spot your crosshair is on - handy for placing props', app)
+
+        tf = ttk.Frame(b)
+        tf.pack(fill='both', expand=True)
+        cols = ('cls', 'hid', 'origin')
+        self.tree = ttk.Treeview(tf, columns=cols, show='tree headings', selectmode='browse')
+        for c, (title, w) in zip(('#0',) + cols, (('Name', 220), ('Class', 220), ('Hammer ID', 90), ('Origin', 240))):
+            self.tree.heading(c, text=title, anchor='w')
+            self.tree.column(c, width=w, stretch=c in ('#0', 'origin'))
+        sb = ttk.Scrollbar(tf, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side='left', fill='both', expand=True)
+        sb.pack(side='left', fill='y')
+        self.tree.bind('<<TreeviewSelect>>', lambda e: self.select_row())
+        self.tree.bind('<Double-1>', lambda e: self.insert('name'))
+        self.q.trace_add('write', lambda *_: self.fill())
+        self.entities = []
+        self._rows = {}
+        self.show(None, None, 'Pick what you\'re looking at in TF2, or pick a row below.')
+        self.center()
+        self.after(50, self.pick if pick_now else self.refresh)
+
+    def ask(self, cmd):
+        """Run a plugin command; None (with a message) when the game or plugin isn't there."""
+        try:
+            out = self.app.game_command(cmd)
+        except rcon.RconError as e:
+            self.show(None, None, f'No game link: {e}')
+            return None
+        if not out.strip():
+            self.show(None, None, 'TF2 answered nothing - the Testscript-Pad plugin isn\'t loaded. '
+                                  'Install it under Tools > Game settings, then restart TF2.')
+            return None
+        err = gamelink.plugin_error(out)
+        if err:
+            self.show(None, None, err)
+            return None
+        return out
+
+    def pick(self):
+        out = self.ask('tsp_pick')
+        if out is None:
+            return
+        ent, hit = gamelink.parse_pick(out)
+        self.show(ent, hit, None if ent or hit else 'Nothing there - look at something and pick again.')
+        self.lift()
+
+    def refresh(self):
+        out = self.ask('tsp_ents')
+        if out is None:
+            return
+        self.entities = gamelink.parse_entities(out)
+        self.fill()
+        if self.current is None and self.aim is None:
+            self.show(None, None, f'{len(self.entities)} entities in the game. '
+                                  'Pick what you\'re looking at in TF2, or pick a row.')
+
+    def fill(self):
+        self.tree.delete(*self.tree.get_children())
+        self._rows = {}
+        q = self.q.get().lower()
+        for e in sorted(self.entities, key=lambda e: (not e['targetname'], e['targetname'].lower(), e['classname'])):
+            if self.named_only.get() and not e['targetname']:
+                continue
+            if q and q not in e['targetname'].lower() and q not in e['classname'].lower() and q not in e['hammerid']:
+                continue
+            iid = self.tree.insert('', 'end', text=e['targetname'],
+                                   values=(e['classname'], e['hammerid'], short_numbers(e['origin'])))
+            self._rows[iid] = e
+
+    def select_row(self):
+        sel = self.tree.selection()
+        if sel and sel[0] in self._rows:
+            self.show(self._rows[sel[0]], None)
+
+    def show(self, ent, hit, message=None):
+        self.current, self.aim = ent, hit
+        if message:
+            self.detail.configure(text=message)
+        else:
+            parts = []
+            if ent:
+                name = f"'{ent['targetname']}' " if ent['targetname'] else ''
+                hid = f"hammerid {ent['hammerid']}" if ent['hammerid'] else 'made by a script / the game'
+                parts.append(f"{ent['classname']} {name}- {hid}\n"
+                             f"origin {short_numbers(ent['origin'])}   angles {short_numbers(ent['angles'])}"
+                             + (f"   model {ent['model']}" if ent['model'] else '')
+                             + (f"   parent {ent['parentname']}" if ent['parentname'] else ''))
+            if hit:
+                parts.append(f'aim point {short_numbers(hit)}')
+            self.detail.configure(text='\n'.join(parts))
+        values = {'name': ent and (ent['targetname'] or ent['hammerid']), 'hid': ent and ent['hammerid'],
+                  'origin': ent and ent['origin'], 'angles': ent and ent['angles'], 'aim': hit}
+        for what, btn in self.buttons:
+            btn.state(['!disabled'] if values[what] else ['disabled'])
+
+    def insert(self, what):
+        e, text = self.current, None
+        if what == 'aim':
+            text = self.aim and short_numbers(self.aim)
+        elif e:
+            text = {'name': e['targetname'] or e['hammerid'], 'hid': e['hammerid'],
+                    'origin': short_numbers(e['origin']), 'angles': short_numbers(e['angles'])}[what]
+        if text:
+            self.ed.text.insert('insert', text)
+            self.ed.text.focus_set()
 
 
 class FindDialog(Dialog):
@@ -2055,6 +2247,8 @@ class App:
             None,
             ('+ Coords', self.coord_dialog, 'Turn getpos output into origin / setpos text (Ctrl+P)'),
             ('Map', lambda: self.map_window(), 'Browse the map\'s entities and pick the script\'s map (Ctrl+M)'),
+            ('Pick', lambda: self.game_entities(pick_now=True),
+             'What are you looking at in TF2? Name, hammerid, origin, aim point (Ctrl+Shift+E, needs the plugin)'),
             None,
             ('▶ Run', self.run_in_game, 'Save and run in TF2 (F9) - set the game folder under Tools > Game settings'),
             ('Check', self.check_now, 'Check the script for problems (F5)'),
@@ -2311,6 +2505,9 @@ class App:
         tl.add_command(label='Game settings...', command=self.game_settings)
         tl.add_command(label='Game console', accelerator='Ctrl+`', command=self.console_window)
         tl.add_command(label='Position from game', accelerator='Ctrl+Shift+P', command=self.position_from_game)
+        tl.add_command(label='Pick what I\'m looking at', accelerator='Ctrl+Shift+E',
+                       command=lambda: self.game_entities(pick_now=True))
+        tl.add_command(label='Game entities...', command=self.game_entities)
         tl.add_command(label='Connect to running game', command=self.link_game)
         tl.add_separator()
         tl.add_command(label='Map entities...', accelerator='Ctrl+M', command=self.map_window)
@@ -2370,6 +2567,7 @@ class App:
             '<F9>': self.run_in_game, '<Control-F9>': self.copy_run_command,
             '<Control-p>': self.coord_dialog, '<Control-m>': self.map_window,
             '<Control-grave>': self.console_window, '<Control-P>': self.position_from_game,
+            '<Control-E>': lambda: self.game_entities(pick_now=True),
             '<Control-equal>': lambda: self.zoom(1), '<Control-plus>': lambda: self.zoom(1),
             '<Control-minus>': lambda: self.zoom(-1), '<Control-0>': lambda: self.zoom(0),
             '<Control-Tab>': lambda: self.cycle_tab(1), '<Control-Shift-Tab>': lambda: self.cycle_tab(-1),
@@ -2853,7 +3051,8 @@ class App:
                 launcher = os.path.join(game_dir, 'tf', 'testscripts', tslang.LAUNCHER_SCRIPT)
                 try:
                     with open(launcher, 'w', encoding='utf-8', newline='\r\n') as f:
-                        f.write(tslang.launcher_script(rel, map_name, st['launch_wait_s']))
+                        f.write(tslang.launcher_script(rel, map_name, st['launch_wait_s'], st['skip_waiting'],
+                                                       st['auto_team'], st['auto_class']))
                 except OSError as e:
                     messagebox.showerror(APP_NAME, f'Could not write {launcher}\n\n{e}', parent=self.root)
                     return
@@ -2912,6 +3111,46 @@ class App:
             self.set_status_message(f"Linked to TF2{' on ' + m.group(1) if m else ''}")
         except rcon.RconError as e:
             self.set_status_message(f'Game link: {e}')
+
+    @staticmethod
+    def plugin_source():
+        """Folder with the built plugin (bundled in the .exe, or plugin/bin from source), or None."""
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        for d in (os.path.join(base, 'plugin', 'bin'), os.path.join(base, 'plugin')):
+            if all(os.path.isfile(os.path.join(d, f)) for f in gamelink.PLUGIN_FILES):
+                return d
+        return None
+
+    def install_plugin(self, game_dir, parent=None):
+        src = self.plugin_source()
+        if src is None:
+            messagebox.showwarning(APP_NAME, "This copy of Testscript-Pad doesn't include the plugin.\n"
+                                             'Build it with plugin\\build_plugin.bat.', parent=parent or self.root)
+            return False
+        if gamelink.game_pids():
+            messagebox.showwarning(APP_NAME, 'Close TF2 first - it keeps the plugin file open while running.',
+                                   parent=parent or self.root)
+            return False
+        try:
+            gamelink.install_plugin(src, game_dir)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f'Could not install the plugin\n\n{e}', parent=parent or self.root)
+            return False
+        self.set_status_message('Plugin installed - TF2 loads it the next time it starts')
+        return True
+
+    def game_entities(self, pick_now=False):
+        ed = self.current()
+        if not ed:
+            return
+        w = getattr(self, '_game_entities', None)
+        if w is not None and w.winfo_exists():
+            w.ed = ed
+            w.lift()
+            if pick_now:
+                w.pick()
+            return
+        self._game_entities = GameEntitiesWindow(self, ed, pick_now)
 
     def console_log_path(self):
         ed = self.current()
@@ -3057,6 +3296,7 @@ class App:
             'Ctrl+M       Map entities (browse the map, pick the script\'s map)',
             'Ctrl+`       Game console (live TF2 console + commands)',
             'Ctrl+Shift+P Position from game (getpos into the coordinate dialog)',
+            'Ctrl+Shift+E Pick what you\'re looking at in TF2 (needs the plugin)',
             'Ctrl+Alt+Up/Down  Number under cursor +1 / -1 (add Shift for 10)',
             'F9           Run in game (save, then launch TF2 or send to the running game)',
             'Ctrl+F9      Copy the test_startscript command only',

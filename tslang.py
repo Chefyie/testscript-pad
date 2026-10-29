@@ -1472,15 +1472,28 @@ def guess_map(relpath, maps):
     return None
 
 
-def launcher_script(relpath, map_name, wait):
-    """Testscript that loads a map, waits, then starts the real script."""
-    return (f'// Written by Testscript-Pad to start {relpath} - safe to delete\n'
-            f'sv_cheats 1;\n'
-            f'map {map_name};\n'
-            f'Test_Wait {format_number(float(wait))};\n'
-            f'sv_cheats 1;\n'
-            f'test_startscript {relpath};\n'
-            f'///\n')
+TEAMS = ['auto', 'red', 'blue', 'spectate']
+CLASSES = ['scout', 'soldier', 'pyro', 'demoman', 'heavyweapons', 'engineer', 'medic', 'sniper', 'spy']
+
+
+def launcher_script(relpath, map_name, wait, skip_waiting=True, team='auto', player_class='scout'):
+    """Testscript that loads a map, gets the player into the game, then starts the real script.
+
+    team / player_class: '' leaves the team / class menus up for you.
+    """
+    lines = [f'// Written by Testscript-Pad to start {relpath} - safe to delete',
+             'sv_cheats 1;',
+             f'map {map_name};',
+             f'Test_Wait {format_number(float(wait))};',
+             'sv_cheats 1;']
+    if skip_waiting:
+        lines.append('mp_waitingforplayers_cancel 1;')
+    if team:
+        lines += ['hidepanel all;', f'jointeam {team};', 'Test_Wait 1;']
+        if player_class and team != 'spectate':
+            lines += [f'joinclass {player_class};', 'hidepanel all;', 'Test_Wait 2;']
+    lines += [f'test_startscript {relpath};', '///']
+    return '\n'.join(lines) + '\n'
 
 
 def launch_options(options):
